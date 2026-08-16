@@ -1,171 +1,81 @@
 # Codex Role Runtime
 
-This directory is the independently tested Role Runtime source component. The user-facing distribution is now the unified `codex-project-memory` plugin in the sibling directory, which bundles this MCP server, Hook, CLI, and role skill together with Project Memory. The standalone installer remains available only for isolated development and recovery.
+This directory is the independently tested role-orchestration source component. Users normally install the unified `codex-project-memory` plugin from the sibling directory.
 
-Codex Role Runtime is a local Codex plugin for **persistent roles over replaceable thread generations**. It keeps role identity, semantic ownership, task state, typed messages, architecture epochs, and verification envelopes outside the model context, so an aging or repeatedly compacted Codex thread can be retired without losing the role.
+Role Runtime keeps persistent role identity, semantic ownership, typed mailboxes, task graphs, policies, and replaceable task generations in SQLite. Codex desktop owns task creation, lookup, messaging, waiting, archiving, and model execution.
 
-The implementation is Codex-native:
+The boundary is intentionally small:
 
-- A User Liaison is the single conversational entry point; the user never needs to operate internal roles directly.
-- Hooks restore a compact role anchor, reject retired generations, enforce role tool policy, and track compaction health.
-- MCP exposes the durable Role / Generation / Task / Message / Ownership / Rotation control plane.
-- SQLite provides atomic cutover, idempotency, crash recovery, and hard invariants.
-- The CLI creates and resumes top-level Codex threads through App Server and deterministically activates them from authoritative SQLite role state.
-- Native Codex subagents remain the right execution mechanism for disposable workers; the runtime does not replace them.
-
-No OpenAI API key is required. Codex App Server uses the user's existing Codex authentication.
+- Hooks initialize role definitions, bind the current task as `role://liaison`, restore compact anchors, and enforce stale-generation/tool policy.
+- MCP persists role state and returns desktop task ids and prompts.
+- The LLM calls Codex desktop task tools directly.
+- The runtime never starts Codex CLI or App Server and never hides model turns inside MCP calls.
 
 ## Core model
 
 ```text
-Persistent Project
-  ├─ User ↔ User Liaison (role://liaison)
-  │            ↕ typed request / result
-  └─ Coordinator (role://coordinator)
-       └─ Persistent Internal Role (for example role://architect)
-       ├─ Structured Role State
-       ├─ Typed Mailbox
-       ├─ Task / Ownership / Architecture Epoch
-       └─ Current Generation
-            └─ Replaceable Codex Thread
+User ↔ Liaison task
+          │ durable request/result
+          ▼
+     Coordinator task ──> internal role tasks
+          │
+          └─ RoleStore / SQLite
+
+Codex desktop tools: list/create/read/send/wait
+Role Runtime MCP: persist/attach/route/checkpoint
 ```
 
-Five invariants are enforced:
+Core invariants:
 
 1. A role has at most one active generation.
-2. A thread's role binding never changes.
-3. Persistent messages are addressed to `role://...`, not stored thread ids.
-4. Results from a non-active generation or stale architecture epoch are rejected.
-5. A candidate is validated before an atomic cutover; failure leaves the old generation active.
+2. A task's role binding never changes.
+3. Messages address `role://...`, not task ids.
+4. Stale generations and architecture epochs cannot author authoritative results.
+5. Attaching a replacement task retires the prior generation atomically.
 
-## Install
+## Development
 
-Requirements: Node.js 22.5 or newer and the Codex CLI.
+Requirements: Node.js 22.5 or newer.
 
 ```powershell
 cd .\codex-role-runtime
 npm ci
 npm test
-.\scripts\install.ps1
+npm run pack:check
 ```
 
-The installer builds the bundle, copies it to `~/plugins/codex-role-runtime`, adds it to the personal marketplace, installs it in Codex, and places durable data under `~/.codex/plugin-data/codex-role-runtime`.
+## One-prompt initialization
 
-Restart Codex, open a new task, and review/trust the plugin hooks with `/hooks`.
-
-## First project: one prompt
-
-Restart Codex, open a new task in the project, and send:
+After plugin installation, open a project task and send:
 
 ```text
 初始化角色编排
 ```
 
-That single prompt:
+The Hook creates Liaison, Coordinator, Architect, and Verifier definitions and binds the current task as Liaison. During that same turn the Liaison model uses desktop `list_projects`, `list_threads`/`read_thread`, and `create_thread` as needed, then calls `role_attach` for the Coordinator.
 
-1. Creates the standard four-role topology idempotently.
-2. Binds the current task to `role://liaison` as the user's entry point. Repeating the exact prompt from another task safely retires the old Liaison generation and hands the role off to the current task.
-3. The Hook itself starts and deterministically activates the first `role://coordinator` task through Codex App Server before the Liaison model turn begins.
-4. Keeps later user requests flowing through `liaison_request`, which verifies or repairs the Coordinator task, wakes it, and returns its result to the Liaison.
+If a stored task is missing, archived, deleted, or unavailable, the model creates a new task and calls `role_attach`. The old generation becomes retired; it is not recovered or resurrected.
 
-The four intentionally narrow, read-only long-lived roles are:
+## Request flow
 
-- `role://liaison` — user conversation, intent clarification, user decisions, and user-facing status/results.
-- `role://coordinator` — project goal, task graph, dependencies, routing, milestones, blockers.
-- `role://architect` — architecture, semantic ownership, dependency direction, cross-module contracts.
-- `role://verifier` — fresh independent acceptance, architecture consistency, diff-versus-intent, test evidence.
+1. `liaison_request` persists intent and returns the Coordinator task id and prompt.
+2. The LLM uses desktop `send_message_to_thread`, `wait_threads`, and optionally `read_thread`.
+3. `liaison_result` persists exactly one result and acknowledges the request.
+4. The Liaison translates it for the user.
 
-Add Module Owners only for real bounded contexts. Use short-lived `workspace_write` workers for implementation.
-
-The Liaison may exchange typed messages only with the Coordinator. Internal roles report to the Coordinator, and the Coordinator returns questions, progress, blockers, and verified results through the Liaison. This keeps one stable user-facing conversation while internal role generations rotate independently.
-
-## Advanced and recovery operations
-
-The CLI and manual binding syntax remain available for recovery, automation, and custom topologies; they are not required for the default flow.
-
-Prepare the standard topology without binding the current task:
-
-```powershell
-node "$HOME\plugins\codex-role-runtime\dist\cli.mjs" init --cwd C:\path\to\project
-```
-
-Bind an ordinary Codex task explicitly:
-
-```text
-role://bind architect
-```
-
-To let the runtime create a fresh top-level thread through Codex App Server:
-
-```powershell
-node "$HOME\plugins\codex-role-runtime\dist\cli.mjs" start architect --cwd C:\path\to\project
-```
-
-Rotate an aging role safely:
-
-```powershell
-node "$HOME\plugins\codex-role-runtime\dist\cli.mjs" rotate architect `
-  --cwd C:\path\to\project `
-  --reason "milestone complete"
-```
-
-Open the active generation later:
-
-```powershell
-node "$HOME\plugins\codex-role-runtime\dist\cli.mjs" open architect --cwd C:\path\to\project
-```
-
-Rotation follows:
-
-```text
-ROTATION_PENDING → DRAINING → CHECKPOINTING → VALIDATING
-→ BOOTSTRAPPING → CUTOVER → COMPLETED
-```
-
-The runtime builds the candidate's bootstrap packet from authoritative SQLite role state, validates it locally, and then performs atomic cutover. Startup does not set an active native goal or wait for a model-generated health echo, so initialization cannot accidentally launch competing model turns. A failed attempt rejects its candidate before a retry. An `active` SQLite row is not treated as sufficient proof of health: `role_start` resumes the backing App Server task, closes incompatible stale rotation residue if that task is missing, and creates one replacement generation. `liaison_request` performs this check automatically before routing.
-
-Role Runtime task ids and Project Memory task ids are separate namespaces. The optional `task_id` accepted by typed Role Runtime messages must name a Role Runtime task; carry a Project Memory association in `payload.project_memory_task_id` instead.
+Internal `message_send` follows the same pattern: persist first, use the returned recipient task id with desktop tools, then persist the typed outcome.
 
 ## MCP surface
 
 | Area | Tools |
 |---|---|
 | Project / status | `status`, `project_initialize`, `project_configure`, `architecture_advance` |
-| Roles / state | `role_define`, `role_list`, `role_bind`, `role_start`, `role_context_get`, `role_state_put`, `role_state_list` |
+| Roles / state | `role_define`, `role_list`, `role_bind`, `role_attach`, `role_context_get`, `role_state_put`, `role_state_list` |
 | Work graph | `task_upsert`, `task_graph`, `change_envelope_create`, `change_envelope_check` |
-| Typed communication | `liaison_request`, `message_send`, `message_inbox`, `message_ack` |
-| Rotation adapters | `rotation_prepare`, `rotation_candidate_register`, `rotation_cutover` |
+| Typed communication | `liaison_request`, `liaison_result`, `message_send`, `message_inbox`, `message_ack` |
+| Advanced rotation | `rotation_prepare`, `rotation_candidate_register`, `rotation_cutover` |
 
-Typed messages support `ASSIGN`, `QUESTION`, `ANSWER`, `PROPOSAL`, `DECISION_REQUEST`, `DECISION`, `HANDOFF`, `VERIFY_REQUEST`, `RESULT`, and `BLOCKED`.
-
-## Context layers
-
-- L0 — project constitution: short global goals, principles, non-goals, and dependency rules.
-- L1 — role charter and structured facts: ownership, accepted decisions, invariants, failures, dependencies, artifacts.
-- L2 — active task packet and change envelope.
-- L3 — disposable thread context: tool output, logs, temporary hypotheses, and local reasoning.
-
-Only L3 is expected to die during generation rotation.
-
-## Current Codex boundary
-
-The local Codex CLI reports App Server as experimental in version `0.147.0`, although its protocol documents `thread/start`, `turn/start`, thread goals, generated schemas, and streamed completion events. The runtime isolates this behind `AppServerClient`; SQLite state, MCP, Hooks, and all core invariants do not depend on the transport implementation. Creating a role generation only needs `thread/start`; model turns begin later when real work is dispatched. If startup fails, no active-generation pointer is changed and the candidate is rejected.
-
-Official references:
-
-- [Codex App Server](https://developers.openai.com/codex/app-server)
-- [Codex Hooks](https://developers.openai.com/codex/hooks)
-- [Codex Plugins](https://developers.openai.com/codex/plugins)
-
-## Development
-
-```powershell
-npm test
-npm run pack:check
-npm run doctor
-```
-
-See [architecture.md](./docs/architecture.md) and [data-model.md](./docs/data-model.md).
+The local CLI is inspection/state-only: `init`, `status`, `doctor`, `bind`, `attach`, and `context`. It does not create, query, open, resume, or run Codex tasks.
 
 ## License
 

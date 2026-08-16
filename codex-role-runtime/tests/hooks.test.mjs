@@ -8,7 +8,7 @@ import { RoleStore, resolveProject } from "../dist/library.mjs";
 
 const hook = resolve("dist/hook.mjs");
 function invoke(cwd, data, input) {
-  const run = spawnSync(process.execPath, ["--no-warnings", hook], { cwd, env: { ...process.env, CODEX_ROLE_RUNTIME_HOME: data, CODEX_ROLE_RUNTIME_TEST_COORDINATOR_THREAD: "thr-test-coordinator" }, input: JSON.stringify(input), encoding: "utf8" });
+  const run = spawnSync(process.execPath, ["--no-warnings", hook], { cwd, env: { ...process.env, CODEX_ROLE_RUNTIME_HOME: data }, input: JSON.stringify(input), encoding: "utf8" });
   assert.equal(run.status, 0, run.stderr); return run.stdout.trim() ? JSON.parse(run.stdout) : {};
 }
 
@@ -18,6 +18,7 @@ test("one prompt initializes the standard topology and binds this task as the us
   const initialized = invoke(cwd, data, { session_id: "thr-user", turn_id: "t0", cwd, hook_event_name: "UserPromptSubmit", prompt: "初始化角色编排" });
   assert.match(initialized.hookSpecificOutput.additionalContext, /role:\/\/liaison/);
   assert.match(initialized.hookSpecificOutput.additionalContext, /communication entry point/);
+  assert.match(initialized.hookSpecificOutput.additionalContext, /Codex desktop task tools/);
 
   const repeated = invoke(cwd, data, { session_id: "thr-user", turn_id: "t1", cwd, hook_event_name: "UserPromptSubmit", prompt: "初始化角色编排。" });
   assert.match(repeated.hookSpecificOutput.additionalContext, /role:\/\/liaison/);
@@ -25,8 +26,8 @@ test("one prompt initializes the standard topology and binds this task as the us
   const store = new RoleStore(data); const project = resolveProject(cwd);
   assert.deepEqual(store.listRoles(project).map((role) => role.role_key).sort(), ["architect", "coordinator", "liaison", "verifier"]);
   assert.equal(store.activeGeneration(project, "liaison").thread_id, "thr-user");
-  assert.equal(store.activeGeneration(project, "coordinator").thread_id, "thr-test-coordinator");
-  assert.equal(store.db.prepare("SELECT count(*) n FROM role_generations").get().n, 2);
+  assert.equal(store.activeGeneration(project, "coordinator"), null);
+  assert.equal(store.db.prepare("SELECT count(*) n FROM role_generations").get().n, 1);
   store.close();
 
   const duplicate = invoke(cwd, data, { session_id: "thr-other", turn_id: "t0", cwd, hook_event_name: "UserPromptSubmit", prompt: "initialize role orchestration" });
@@ -34,8 +35,8 @@ test("one prompt initializes the standard topology and binds this task as the us
   const afterHandoff = new RoleStore(data); const handedOffProject = resolveProject(cwd);
   assert.equal(afterHandoff.activeGeneration(handedOffProject, "liaison").thread_id, "thr-other");
   assert.equal(afterHandoff.activeGeneration(handedOffProject, "liaison").generation_number, 2);
-  assert.equal(afterHandoff.activeGeneration(handedOffProject, "coordinator").thread_id, "thr-test-coordinator");
-  assert.equal(afterHandoff.db.prepare("SELECT count(*) n FROM role_generations WHERE status='active'").get().n, 2);
+  assert.equal(afterHandoff.activeGeneration(handedOffProject, "coordinator"), null);
+  assert.equal(afterHandoff.db.prepare("SELECT count(*) n FROM role_generations WHERE status='active'").get().n, 1);
   afterHandoff.close();
   const staleLiaison = invoke(cwd, data, { session_id: "thr-user", turn_id: "t2", cwd, hook_event_name: "UserPromptSubmit", prompt: "continue" });
   assert.equal(staleLiaison.decision, "block");

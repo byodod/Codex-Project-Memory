@@ -34,7 +34,7 @@ sh ./scripts/install.sh
 
 Then restart Codex and begin a new task. Plugin hooks are non-managed code: open `/hooks`, inspect them, and trust the current definitions. The plugin exposes `project_memory` and `role_runtime` MCP servers.
 
-To initialize the default role topology, send `初始化角色编排`. The integrated Hook binds the current task as `role://liaison` and deterministically starts `role://coordinator` before the Liaison model turn begins. Repeating the exact prompt from another task safely hands the Liaison generation off to that task and reuses the existing Coordinator. Reuse includes an App Server existence check: if SQLite still calls the Coordinator active after its Codex task disappeared, the Hook or next Liaison request closes stale recovery residue and deterministically creates one replacement. When the Coordinator sends `ASSIGN`, `VERIFY_REQUEST`, or `HANDOFF`, Role Runtime creates the target role task when needed and immediately wakes it to process the durable inbox. Stable message IDs prevent duplicate turns; failed wakes remain retryable, and result messages never recursively wake a Coordinator turn that is already running.
+To initialize the default role topology, send `初始化角色编排`. The integrated Hook creates the four role definitions and binds the current task as `role://liaison`. In that same turn, the Liaison model uses Codex desktop task interfaces to find or create the Coordinator and records the actual task id with `role_attach`. Repeating the exact prompt from another task hands the Liaison generation off safely. If any bound role task is missing, archived, deleted, or unavailable, the model simply creates a new desktop task and attaches it; the old generation is retired. MCP calls persist role state and typed messages but never start Codex CLI, App Server, or hidden model turns.
 
 ## Normal Codex workflow
 
@@ -69,7 +69,7 @@ The `Stop` Hook asks Codex for one continuation when an enabled active task stil
 
 Always pass the current repository directory as `cwd` when calling MCP tools.
 
-Role Runtime adds role definition/status, `role_start`, role facts, task graph, typed mailboxes, Liaison-to-Coordinator requests, change envelopes, architecture epochs, and atomic generation rotation. Project Memory remains the durable user-level completion contract; Role Runtime is the internal execution graph. Their task ids are separate namespaces: Role Runtime `task_id` fields only accept Role Runtime task ids, while a Project Memory association belongs in `payload.project_memory_task_id`.
+Role Runtime adds role definition/status, `role_attach`, role facts, task graph, typed mailboxes, Liaison-to-Coordinator request/result persistence, change envelopes, architecture epochs, and atomic generation replacement. Project Memory remains the durable user-level completion contract; Role Runtime is the internal execution graph. Their task ids are separate namespaces: Role Runtime `task_id` fields only accept Role Runtime task ids, while a Project Memory association belongs in `payload.project_memory_task_id`.
 
 ## Reset one project completely
 
@@ -134,7 +134,7 @@ npm run doctor
 npm run pack:check
 ```
 
-The tests exercise task completion gates, FTS relevance and recall metadata, supersession, duplicate consolidation, merged Hook behavior, role startup cleanup/idempotency, and real stdio exchanges with both MCP servers.
+The tests exercise task completion gates, FTS relevance and recall metadata, supersession, duplicate consolidation, merged Hook behavior, desktop-task attachment/replacement, durable request/result routing, and real stdio exchanges with both MCP servers.
 
 ## Updating a local installation
 

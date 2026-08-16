@@ -66,13 +66,14 @@ test("integrated Hook merges project memory with role initialization and policy"
   memory.storeMemory(project, { task_id: task.id, kind: "constraint", summary: "Protected boundary", content: "Do not edit generated files", authority: "project_authority", importance: 1 });
   memory.close();
 
-  const env = { ...process.env, CODEX_PROJECT_MEMORY_HOME: memoryData, CODEX_ROLE_RUNTIME_HOME: roleData, CODEX_ROLE_RUNTIME_TEST_COORDINATOR_THREAD: "thr-integrated-coordinator" };
+  const env = { ...process.env, CODEX_PROJECT_MEMORY_HOME: memoryData, CODEX_ROLE_RUNTIME_HOME: roleData };
   const invokeIntegrated = (input) => {
     const run = spawnSync(process.execPath, ["--no-warnings", integratedHookPath], { cwd, env, input: JSON.stringify(input), encoding: "utf8" });
     assert.equal(run.status, 0, run.stderr); return run.stdout.trim() ? JSON.parse(run.stdout) : {};
   };
   const initialized = invokeIntegrated({ session_id: "thr-integrated-user", turn_id: "t0", cwd, hook_event_name: "UserPromptSubmit", prompt: "初始化角色编排" });
   assert.match(initialized.hookSpecificOutput.additionalContext, /communication entry point/);
+  assert.match(initialized.hookSpecificOutput.additionalContext, /Codex desktop task tools/);
   const handedOff = invokeIntegrated({ session_id: "thr-integrated-user-2", turn_id: "t0", cwd, hook_event_name: "UserPromptSubmit", prompt: "启动角色编排" });
   assert.match(handedOff.hookSpecificOutput.additionalContext, /resumed and handed off/);
   const resumed = invokeIntegrated({ session_id: "thr-integrated-user", cwd, hook_event_name: "SessionStart", source: "resume" });
@@ -84,7 +85,7 @@ test("integrated Hook merges project memory with role initialization and policy"
 
   const roleStore = new (await import("../dist/role-library.mjs")).RoleStore(roleData);
   const roleProject = (await import("../dist/role-library.mjs")).resolveProject(cwd);
-  assert.equal(roleStore.activeGeneration(roleProject, "coordinator").thread_id, "thr-integrated-coordinator");
+  assert.equal(roleStore.activeGeneration(roleProject, "coordinator"), null);
   assert.equal(roleStore.activeGeneration(roleProject, "liaison").thread_id, "thr-integrated-user-2");
   roleStore.close();
 });

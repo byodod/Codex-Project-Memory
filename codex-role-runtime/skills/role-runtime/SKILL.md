@@ -1,72 +1,60 @@
 ---
 name: role-runtime
-description: Keep persistent project roles independent from replaceable Codex thread generations. Use when the user asks to initialize role orchestration, define roles, assign semantic ownership, route work between roles, use a User Liaison, inspect a role mailbox or task graph, enforce role permissions, start or rotate a role session, recover a stale role thread, or orchestrate long modular development with Liaison, Coordinator, Architect, Module Owner, Worker, and Verifier responsibilities. Do not use for ordinary short tasks that need no persistent role topology.
+description: Keep persistent project roles independent from replaceable Codex desktop task generations. Use when the user asks to initialize role orchestration, use a User Liaison or Coordinator, route typed role work, inspect role state, attach or replace role tasks, or orchestrate long modular development. Do not use for ordinary short tasks that need no persistent role topology.
 ---
 
 # Codex Role Runtime
 
-Use the `role_runtime` MCP tools as the authoritative control plane. Role identity and structured state live outside model context; a Codex thread is only one replaceable generation.
+Use `role_runtime` as the durable role control plane and Codex desktop task tools as the task transport. The MCP server stores identities, generations, task graphs, mailboxes, policies, and checkpoints. It never queries, creates, resumes, archives, or runs Codex tasks and never invokes the Codex CLI or App Server.
 
 ## Invariants
 
-- Address persistent peers as `role://<role-key>`, never by stored thread id.
-- A thread belongs to one role for life. Never reuse a thread under a different role.
-- A role has at most one active generation.
+- Address roles as `role://<role-key>`, never by task id.
+- One task belongs to one role for life; one role has at most one active generation.
 - Only the active generation may write role state or send authoritative results.
-- Validate a candidate bootstrap before atomic cutover; keep the old generation active on failure.
-- Carry the current `architecture_epoch` in messages, tasks, and change envelopes. Stale work must be refreshed.
-- `role://liaison` is the sole user-facing role. It exchanges requests and results only with `role://coordinator`; internal roles do not require the user to contact them.
+- `role://liaison` is the sole user-facing role and exchanges user intent only with `role://coordinator`.
+- Carry the current `architecture_epoch` in typed work. Reject stale work.
 
-## Default one-prompt start
+## Initialize in one user turn
 
-When the user sends exactly `初始化角色编排`, `启动角色编排`, or `initialize role orchestration`, the `UserPromptSubmit` hook idempotently creates the standard Liaison, Coordinator, Architect, and Verifier topology and binds the current task to `role://liaison`. If another Liaison task is active, the exact prompt deterministically hands the Liaison generation off to the current task and retires the old generation while reusing the existing Coordinator.
+When the user sends exactly `初始化角色编排`, `启动角色编排`, or `initialize role orchestration`, the Hook creates the Liaison, Coordinator, Architect, and Verifier definitions and binds the current task as Liaison. If another Liaison task is active, it is retired and the current task becomes the new generation.
 
-The Hook starts the Coordinator itself before the Liaison model turn. After it binds the Liaison:
+In that same model turn:
 
-1. Call `status` with the current `cwd`.
-2. Confirm the Coordinator is active. If startup was interrupted, call the idempotent `role_start` for `coordinator` to recover it; do not ask the user to run a CLI command. `role_start` verifies that the recorded App Server task still exists and replaces a missing task after closing stale bootstrap/rotation residue.
-3. Confirm that the user-facing entry and Coordinator are ready. Do not expose internal thread ids.
+1. Call `role_runtime.status`.
+2. Use Codex desktop `list_projects` and `list_threads`/`read_thread` to check the stored Coordinator task id.
+3. If no Coordinator is attached, or the attached task is missing, archived, deleted, or unavailable, call desktop `create_thread` for a local task in the current project. Use a prompt containing the Coordinator role anchor and tell it to await routed work.
+4. Call `role_runtime.role_attach` with `role_key: "coordinator"` and the returned task id. A different id retires the old generation automatically.
+5. Report that Liaison and Coordinator are ready. Do not expose internal task ids unless debugging requires them.
 
-For each later substantive user request, clarify only material ambiguity, then call `liaison_request` with the current Liaison generation and a faithful structured request. It starts or repairs the Coordinator before routing and retries once if the task disappears between the health check and dispatch. The Coordinator returns its final reply as assistant text; it must not call `liaison_request` or `message_send` for that final reply because the outer request persists exactly one RESULT. Translate the returned response into concise user-facing language. Do not implement, schedule, architect, or verify work inside the Liaison task.
+Do not attempt to restore an unavailable task. Create a replacement and attach it.
 
-`liaison_request.task_id` and `message_send.task_id` refer only to tasks in the Role Runtime task graph. To associate a request with a Project Memory task, put that id in `payload.project_memory_task_id`; the two control-plane ids are intentionally not interchangeable.
+## Route a Liaison request
 
-If custom initialization is required, use `project_initialize`, `project_configure`, and `role_define`. Long-lived governance and owner roles should normally be `read_only`; use short-lived `workspace_write` workers for implementation. Record critical invariants, accepted decisions, ownership, open questions, failures, and artifacts with `role_state_put`, never transcript summaries.
+1. Call `liaison_request` with the current Liaison generation and a stable `message_id`. This only persists intent and returns a Coordinator task id plus a prompt.
+2. If its recipient status is `needs_task`, create a desktop task and call `role_attach`, then call `liaison_request` again with the same `message_id`.
+3. Use desktop `send_message_to_thread` with the returned prompt.
+4. Use desktop `wait_threads`, then `read_thread` when needed, to obtain the result.
+5. Call `liaison_result` once with the request message id and result text. This durably records one RESULT and acknowledges the request.
+6. Translate the result into user-facing language.
 
-## Bind or create a generation
+`liaison_request.task_id` and `message_send.task_id` accept Role Runtime task-graph ids only. Put a Project Memory task association in `payload.project_memory_task_id`.
 
-- For advanced recovery or custom topology work, an existing unbound Codex task can submit exactly `role://bind <role-key>`. The `UserPromptSubmit` hook binds generation 1 if the role is unbound.
-- Alternatively call `role_bind` with an explicit thread id.
-- For a fresh App Server managed thread, use the CLI `start <role-key>` command.
-- Do not soft-switch one thread to another role.
+## Route internal work
 
-## Orchestrate work
+The Coordinator owns the internal role graph. For an assignment:
 
-1. Keep the Liaison user-focused and the Coordinator compact. The Liaison uses `liaison_request`; the Coordinator uses `task_upsert` and `task_graph`, storing pointers and blockers rather than all module knowledge.
-2. Route decisions through the semantic owner. Use `message_send` with a typed message and the sender's active generation plus current architecture epoch. `ASSIGN`, `VERIFY_REQUEST`, and `HANDOFF` automatically create and wake a non-Coordinator recipient task. Reuse a stable `message_id`: completed dispatches deduplicate, while failed wakes can retry. Result traffic back to the Coordinator is mailbox-only so it cannot start a competing Coordinator turn.
-3. Read a role's work with `message_inbox`; acknowledge consumed messages with `message_ack`.
-4. Give a writable worker a `change_envelope_create` packet: intent, allowed scope regexes, symbols, constraints, non-goals, and tests.
-5. Compare actual changed paths with `change_envelope_check` before accepting the result.
-6. Use a fresh Verifier generation for important acceptance work.
+1. Persist it with `message_send`; the result contains the recipient's attached desktop task id or `needs_task`.
+2. If needed, create a local desktop task for that role and call `role_attach`. If the stored task is archived, deleted, missing, or unavailable, create a new one and attach it directly.
+3. Send a prompt to the desktop task with `send_message_to_thread`; wait/read through desktop tools.
+4. Persist the role's `RESULT`, `BLOCKED`, or `QUESTION` with `message_send`, and acknowledge consumed inbox items with `message_ack`.
 
-## Rotate safely
+Use `task_upsert`/`task_graph` for coordination, `role_state_put` for durable role facts, and change envelopes for writable workers. Long-lived governance roles should normally be read-only; disposable implementation workers may write within a bounded envelope.
 
-Rotation is normal lifecycle, not emergency repair. Consider it after a milestone, material charter/architecture change, first compaction at a task boundary, or whenever generation health becomes `rotation_required`.
+## Generation replacement
 
-Preferred one-command flow:
+`role_attach` is the normal lifecycle operation. Supplying the current task id is idempotent. Supplying a new task id validates local authoritative state, retires the old generation, and activates the new one atomically. There is no task recovery state machine.
 
-`node <plugin-root>/dist/cli.mjs rotate <role-key> --cwd <project> --reason <reason>`
+Advanced external drivers may use `rotation_prepare`, `rotation_candidate_register`, and `rotation_cutover`, but ordinary desktop orchestration should use `role_attach`.
 
-The CLI performs `ROTATION_PENDING → DRAINING → CHECKPOINTING → VALIDATING → BOOTSTRAPPING → CUTOVER`, creates a new thread through Codex App Server, validates an authoritative bootstrap packet locally, and switches atomically. Initialization does not set an active native goal or wait for a model echo. If bootstrap fails, the candidate is rejected and the old generation stays active. If SQLite says a generation is active but App Server reports that its task no longer exists, `role_start` closes incompatible stale rotation residue and uses this same deterministic cutover path to replace it exactly once.
-
-For an external driver, use `rotation_prepare`, `rotation_candidate_register`, and `rotation_cutover` in that order.
-
-## Hooks
-
-- `SessionStart` and `UserPromptSubmit` inject a compact role anchor; an exact initialization prompt creates the standard topology and binds the current task as Liaison.
-- `UserPromptSubmit` and `PreToolUse` reject retired generations and prevent bootstrapping candidates from starting recursive work before cutover.
-- `PreToolUse` enforces the role's denied-tool policy.
-- `PreCompact` records a checkpoint event; `PostCompact` increments generation health once per event.
-- Hook events are advisory evidence except for explicit stale-generation and tool-policy blocks.
-
-Current user instructions, repository `AGENTS.md`, accepted ADRs, and CI remain authoritative over stored role state.
+Retired and rejected generations cannot continue. Before compaction, handoff, replacement, or completion, checkpoint durable state. Current user instructions, repository `AGENTS.md`, accepted ADRs, and fresh verification outrank stored role state.

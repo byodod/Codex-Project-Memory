@@ -70,8 +70,15 @@ test("the unified plugin exposes the role-runtime MCP server from the same packa
   });
   try {
     await client.connect(transport);
+    const listed = await client.listTools();
+    const names = new Set(listed.tools.map((item) => item.name));
+    for (const required of ["role_attach", "liaison_request", "liaison_result", "message_send"]) assert.ok(names.has(required), `${required} missing`);
+    assert.equal(names.has("role_start"), false, "Role MCP must not expose hidden task startup");
     const initialized = await client.callTool({ name: "project_initialize", arguments: { cwd } });
     assert.equal(initialized.isError, undefined);
+    const attached = await client.callTool({ name: "role_attach", arguments: { cwd, role_key: "coordinator", thread_id: "desktop-created-task" } });
+    assert.equal(attached.isError, undefined);
+    assert.match(attached.content[0].text, /desktop-created-task/);
     const status = await client.callTool({ name: "status", arguments: { cwd } });
     assert.equal(status.isError, undefined);
     assert.match(status.content[0].text, /role-runtime.sqlite3/);

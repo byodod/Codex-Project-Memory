@@ -1,38 +1,54 @@
 ---
 name: role-runtime
-description: Initialize and operate persistent Codex project roles together with durable project memory. Use when the user asks for role orchestration, a User Liaison or Coordinator, semantic ownership, typed role routing, task graphs, role permissions, generation startup or rotation, or recovery of a stale role task. Do not use for short work that needs neither persistent roles nor durable project state.
+description: Initialize and operate persistent Codex project roles together with durable project memory. Use for role orchestration, a User Liaison or Coordinator, semantic ownership, typed routing, task graphs, role permissions, or attaching and replacing desktop task generations. Do not use for short work that needs neither persistent roles nor durable project state.
 ---
 
 # Integrated Role Runtime
 
-Use `role_runtime` for role identity, routing, ownership, mailboxes, policy, and replaceable Codex task generations. Use `project_memory` for the project-level goal, acceptance criteria, durable decisions, failures, verification evidence, and resumable next steps. They are two control planes in one plugin and one workflow; do not make the user coordinate them separately.
+Use `role_runtime` for role identity, routing, ownership, mailboxes, policies, and task-generation bindings. Use `project_memory` for the user-level goal, acceptance criteria, durable decisions, failures, verification, and resumable next steps. They are one workflow, but their task ids remain separate namespaces.
 
-Do not use a host/global memory summary as a substitute for the repository-scoped Project Memory database. Read `project_memory.task_get` first and use `memory_search` for durable project history.
+Codex desktop task tools are the only task transport. The Role Runtime MCP stores state; it never queries, creates, resumes, archives, or runs Codex tasks and never invokes Codex CLI or App Server.
 
 ## One-prompt initialization
 
-When the user sends exactly `初始化角色编排`, `启动角色编排`, or `initialize role orchestration`, the integrated Hook must:
+When the user sends exactly `初始化角色编排`, `启动角色编排`, or `initialize role orchestration`, the Hook creates Liaison, Coordinator, Architect, and Verifier definitions and binds the current task as the sole user-facing Liaison. If another Liaison is active, the current task replaces it.
 
-1. Idempotently create Liaison, Coordinator, Architect, and Verifier roles.
-2. Bind the current task to `role://liaison`, the only user-facing role. If another Liaison task is active, deterministically hand the Liaison generation off to the current task and retire the old generation.
-3. Create and deterministically activate the Coordinator task before the Liaison model turn begins.
+In that same model turn:
 
-Afterward, call both `role_runtime.status` and `project_memory.task_get` with the current `cwd`. If the Coordinator startup was interrupted, call the idempotent `role_start`; do not ask the user to repair it. `role_start` verifies the recorded App Server task rather than trusting SQLite health alone and deterministically replaces a missing task. If no matching project-memory task exists for substantive work, create one with `task_upsert`.
+1. Call `role_runtime.status` and `project_memory.task_get` with the current `cwd`.
+2. Use Codex desktop `list_projects` and `list_threads`/`read_thread` to inspect the attached Coordinator task.
+3. If no Coordinator is attached, or its task is missing, archived, deleted, or unavailable, call desktop `create_thread` for a local task in the current project. Give it the Coordinator anchor and tell it to await routed work.
+4. Call `role_runtime.role_attach` with the returned task id. Supplying a different id retires the old generation atomically.
+5. Confirm Liaison and Coordinator readiness. Do not expose internal task ids unless debugging requires them.
 
-## Shared operating model
+Do not recover or resurrect an unavailable task. Create a replacement and attach it.
 
-- The Liaison clarifies user intent and uses `liaison_request`; it does not implement or internally coordinate work. The Coordinator returns the final Liaison response as assistant text, and the outer request persists exactly one RESULT; do not recursively call `liaison_request` or `message_send` for that final reply.
-- The Coordinator owns the role task graph and routes work. It keeps the current project-memory task aligned with the user's goal, acceptance criteria, completed items, blockers, and next steps.
-- Architect and module owners store role-specific charters, ownership, and invariants with `role_state_put`. Cross-role decisions and reusable project facts also go to `memory_store` with honest provenance.
-- Workers receive a bounded change envelope and perform implementation. Record meaningful build/test/review results with `verification_record`.
-- The Verifier independently checks acceptance. Only after criteria are satisfied should the Coordinator clear project-memory next steps/blockers and complete the task.
+## Liaison to Coordinator
 
-Project Memory is the durable user-level completion contract. Role Runtime tasks are the internal execution graph. Their ids are different namespaces: `liaison_request.task_id` and `message_send.task_id` accept only Role Runtime task ids. Link a request or role task to Project Memory with `payload.project_memory_task_id` when useful; never create contradictory sources of truth.
+For each substantive request:
+
+1. Clarify only material ambiguity.
+2. Call `liaison_request` with a stable `message_id`. It persists the request and returns a Coordinator task id and prompt; it does not start a model turn.
+3. If the recipient is `needs_task`, create a desktop task, call `role_attach`, and repeat `liaison_request` with the same id.
+4. Use desktop `send_message_to_thread`, then `wait_threads` and optionally `read_thread`.
+5. Call `liaison_result` exactly once to store the Coordinator response and acknowledge the request.
+6. Relay the result to the user in concise language.
+
+The Liaison does not implement, schedule, architect, or verify internal work. The Coordinator does not address the user directly.
+
+## Coordinator operation
+
+- Keep the Role Runtime task graph aligned with the Project Memory goal, acceptance criteria, completed items, blockers, and next steps.
+- Persist internal traffic with `message_send`. It returns the recipient's desktop task id or `needs_task`; it never wakes a task itself.
+- For a missing, archived, deleted, or unavailable role task, create a new local desktop task and call `role_attach`. Then use desktop send/wait/read tools.
+- Store role charters and invariants with `role_state_put`; store reusable cross-role project facts with `project_memory.memory_store` using honest provenance.
+- Give writable workers bounded change envelopes. Record meaningful test/build/review evidence with `verification_record`.
+- Use a fresh Verifier generation when independence matters. Complete Project Memory only after criteria pass and blockers/next steps are empty.
+
+`liaison_request.task_id` and `message_send.task_id` accept Role Runtime task-graph ids only. Carry a Project Memory task id in `payload.project_memory_task_id`.
 
 ## Generation lifecycle
 
-Address roles as `role://<role-key>`, never by task id. A task belongs to one role for life, and only the active generation may send authoritative results. `role_start` is idempotent: it resumes the recorded App Server task to verify existence, and if the task is gone it closes stale recovery residue and deterministically replaces the generation. Rotation creates a candidate task, validates authoritative SQLite state locally, and atomically cuts over without setting an active goal or waiting for a model health echo. Failed candidates are rejected; the prior active generation remains authoritative when it still exists.
+Address roles as `role://<role-key>`, never by task id. A task belongs to one role for life, and only the active generation may send authoritative results. `role_attach` is idempotent for the current id; a new id validates authoritative local state, retires the old generation, and activates the new one. There is no task recovery state machine.
 
-Bootstrapping candidates may receive a role anchor but cannot accept prompts or tools before cutover. Retired and rejected generations are stale and must not continue work.
-
-Before compaction, handoff, rotation, or completion, update the project-memory task and checkpoint it. Current user instructions, repository `AGENTS.md`, accepted ADRs, and fresh verification evidence outrank recalled history.
+Retired and rejected generations cannot continue. Before compaction, handoff, replacement, or completion, update and checkpoint Project Memory. Current user instructions, repository `AGENTS.md`, accepted ADRs, and fresh verification outrank recalled history.

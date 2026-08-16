@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { resolveProject } from "./project.js";
-import { dispatchLiaisonRequest, dispatchRoleMessage, startRoleGeneration } from "./generation-service.js";
+import { attachRoleThread, prepareLiaisonRequest, recordLiaisonResult, routeRoleMessage } from "./generation-service.js";
 import { RoleStore } from "./store.js";
 import { initializeStandardTopology } from "./topology.js";
 import { FACT_KINDS, MESSAGE_TYPES, ROLE_KINDS } from "./types.js";
@@ -16,10 +16,6 @@ function result(value: unknown) {
 function run<T>(workingDirectory: string | undefined, action: (store: RoleStore, project: ReturnType<typeof resolveProject>) => T) {
   const store = new RoleStore();
   try { return result(action(store, resolveProject(workingDirectory || process.cwd()))); } finally { store.close(); }
-}
-async function runAsync<T>(workingDirectory: string | undefined, action: (store: RoleStore, project: ReturnType<typeof resolveProject>) => Promise<T>) {
-  const store = new RoleStore();
-  try { return result(await action(store, resolveProject(workingDirectory || process.cwd()))); } finally { store.close(); }
 }
 function tool(name: string, config: any, callback: any): void {
   server.registerTool(name, {
@@ -67,10 +63,10 @@ tool("role_bind", {
   inputSchema: { cwd, role_key: z.string(), thread_id: z.string().min(1) }, annotations: { readOnlyHint: false, idempotentHint: true }
 }, ({ cwd, role_key, thread_id }: any) => run(cwd, (store, project) => store.bindInitial(project, role_key, thread_id)));
 
-tool("role_start", {
-  title: "Start or recover role task", description: "Verify the active App Server task, return it idempotently when present, or deterministically replace a missing task without competing bootstrap turns.",
-  inputSchema: { cwd, role_key: z.string(), model: z.string().optional() }, annotations: { readOnlyHint: false, idempotentHint: true }
-}, ({ cwd, role_key, model }: any) => runAsync(cwd, (store, project) => startRoleGeneration(store, project, role_key, { ...(model ? { model } : {}) })));
+tool("role_attach", {
+  title: "Attach desktop task to role", description: "Bind a task id already found or created through Codex desktop tools. A different task id atomically retires the prior generation; this tool never queries, creates, resumes, or runs a task.",
+  inputSchema: { cwd, role_key: z.string(), thread_id: z.string().min(1), reason: z.string().max(2000).optional() }, annotations: { readOnlyHint: false, idempotentHint: true }
+}, ({ cwd, role_key, thread_id, reason }: any) => run(cwd, (store, project) => attachRoleThread(store, project, role_key, thread_id, reason)));
 
 tool("role_context_get", {
   title: "Get layered role context", description: "Read the L0 constitution, L1 charter/state, active L2 tasks, generation, epoch, and pending mailbox count.",
@@ -106,13 +102,13 @@ tool("task_graph", {
 }, ({ cwd }: any) => run(cwd, (store, project) => store.taskGraph(project)));
 
 tool("message_send", {
-  title: "Send typed role message", description: "Route an idempotent typed message to role:// identity. ASSIGN, VERIFY_REQUEST, and HANDOFF automatically create and wake non-Coordinator recipient tasks; result traffic never recursively wakes a running Coordinator.",
+  title: "Send typed role message", description: "Persist an idempotent typed message and return the recipient's attached desktop task id. The LLM uses Codex desktop tools to create, send to, or wait for that task; no hidden model turn occurs here.",
   inputSchema: {
     cwd, message_id: z.string().optional(), type: z.enum(MESSAGE_TYPES), from_role: z.string(), to_role: z.string(),
     from_generation: z.number().int().positive(), task_id: z.string().optional(), scope: z.string().max(2000).optional(),
     architecture_epoch: z.number().int().positive(), payload: z.unknown(), evidence_refs: z.array(z.string()).max(100).optional(), reply_to: z.string().optional()
   }, annotations: { readOnlyHint: false, idempotentHint: true }
-}, ({ cwd, ...input }: any) => runAsync(cwd, (store, project) => dispatchRoleMessage(store, project, input)));
+}, ({ cwd, ...input }: any) => run(cwd, (store, project) => routeRoleMessage(store, project, input)));
 
 tool("message_inbox", {
   title: "Read role mailbox", description: "Read typed messages addressed to a role and mark pending messages delivered.",
@@ -125,12 +121,20 @@ tool("message_ack", {
 }, ({ cwd, role_key, message_id }: any) => run(cwd, (store, project) => store.acknowledgeMessage(project, role_key, message_id)));
 
 tool("liaison_request", {
-  title: "Send user request through Coordinator", description: "Start or recover the Coordinator task, send a user request from the active Liaison generation, wait for its response, and persist the response back to the Liaison mailbox. task_id, when supplied, is a Role Runtime task id rather than a Project Memory task id.",
+  title: "Prepare user request for Coordinator", description: "Persist a user request and return the Coordinator desktop task route and prompt. The LLM sends and waits through Codex desktop task tools. task_id, when supplied, is a Role Runtime task id rather than a Project Memory task id.",
   inputSchema: {
     cwd, liaison_generation: z.number().int().positive(), request: z.string().min(1).max(20000),
     task_id: z.string().optional(), scope: z.string().max(2000).optional(), message_id: z.string().optional()
   }, annotations: { readOnlyHint: false, idempotentHint: false }
-}, ({ cwd, ...input }: any) => runAsync(cwd, (store, project) => dispatchLiaisonRequest(store, project, input)));
+}, ({ cwd, ...input }: any) => run(cwd, (store, project) => prepareLiaisonRequest(store, project, input)));
+
+tool("liaison_result", {
+  title: "Record Coordinator result", description: "Persist the Coordinator response obtained through desktop wait/read, acknowledge the durable request, and return the Liaison result. Reusing the same request id is idempotent when the response is unchanged.",
+  inputSchema: {
+    cwd, request_message_id: z.string().min(1), response: z.string().min(1).max(50000),
+    message_id: z.string().optional(), evidence_refs: z.array(z.string()).max(100).optional()
+  }, annotations: { readOnlyHint: false, idempotentHint: true }
+}, ({ cwd, ...input }: any) => run(cwd, (store, project) => recordLiaisonResult(store, project, input)));
 
 tool("architecture_advance", {
   title: "Advance architecture epoch", description: "Invalidate work packets from the old architecture after an accepted material architecture change.",
@@ -157,7 +161,7 @@ tool("rotation_prepare", {
 }, ({ cwd, role_key, reason }: any) => run(cwd, (store, project) => store.createRotation(project, role_key, reason)));
 
 tool("rotation_candidate_register", {
-  title: "Register candidate generation", description: "Register a new App Server thread as a bootstrapping candidate; it is not active yet.",
+  title: "Register candidate generation", description: "Register a desktop task as a bootstrapping candidate; it is not active yet.",
   inputSchema: { cwd, role_key: z.string(), thread_id: z.string(), bootstrap_hash: z.string().optional() }, annotations: { readOnlyHint: false, idempotentHint: false }
 }, ({ cwd, role_key, thread_id, bootstrap_hash }: any) => run(cwd, (store, project) => store.createCandidate(project, role_key, thread_id, bootstrap_hash)));
 

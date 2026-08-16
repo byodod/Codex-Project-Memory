@@ -1,213 +1,7 @@
 // src/hook.ts
 import { readFileSync } from "node:fs";
 
-// src/app-server.ts
-import { execFileSync, spawn } from "node:child_process";
-import { createInterface } from "node:readline";
-function isMissingThreadError(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  return /no rollout found|no codex thread found|thread(?: id)?[^\n]*not found|unknown thread/i.test(message);
-}
-function resolveCodexBinary() {
-  if (process.env.CODEX_BIN) {
-    return process.env.CODEX_BIN;
-  }
-  if (process.platform === "win32") {
-    try {
-      const candidates = execFileSync("where.exe", ["codex.cmd"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
-      if (candidates[0]) return candidates[0];
-    } catch {
-    }
-  }
-  return "codex";
-}
-var AppServerClient = class _AppServerClient {
-  child;
-  lines;
-  nextId = 1;
-  pending = /* @__PURE__ */ new Map();
-  listeners = /* @__PURE__ */ new Set();
-  stderr = [];
-  constructor(command = resolveCodexBinary()) {
-    this.child = spawn(command, ["app-server", "--stdio"], {
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-      shell: process.platform === "win32" && !command.toLowerCase().endsWith(".exe")
-    });
-    this.lines = createInterface({ input: this.child.stdout });
-    this.lines.on("line", (line) => this.onLine(line));
-    this.child.stderr.setEncoding("utf8");
-    this.child.stderr.on("data", (chunk) => {
-      this.stderr.push(chunk);
-      if (this.stderr.length > 50) this.stderr.shift();
-    });
-    this.child.on("exit", (code) => {
-      const error = new Error(`Codex app-server exited with ${code}. ${this.stderr.join("").slice(-2e3)}`);
-      for (const waiter of this.pending.values()) {
-        clearTimeout(waiter.timer);
-        waiter.reject(error);
-      }
-      this.pending.clear();
-      for (const listener of [...this.listeners]) listener({ method: "app-server/exited", params: { error: error.message } });
-    });
-  }
-  static async connect() {
-    const client = new _AppServerClient();
-    await client.request("initialize", { clientInfo: { name: "codex-role-runtime", title: "Codex Role Runtime", version: "1.0.0" } });
-    client.notify("initialized", {});
-    return client;
-  }
-  onLine(line) {
-    let message;
-    try {
-      message = JSON.parse(line);
-    } catch {
-      return;
-    }
-    if (typeof message.id === "number" && (message.result !== void 0 || message.error !== void 0)) {
-      const waiter = this.pending.get(message.id);
-      if (!waiter) return;
-      clearTimeout(waiter.timer);
-      this.pending.delete(message.id);
-      if (message.error) waiter.reject(new Error(`App Server RPC error: ${JSON.stringify(message.error)}`));
-      else waiter.resolve(message.result);
-      return;
-    }
-    for (const listener of this.listeners) listener(message);
-  }
-  request(method, params, timeoutMs = 3e4) {
-    const id = this.nextId++;
-    return new Promise((resolve2, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`App Server timeout: ${method}`));
-      }, timeoutMs);
-      this.pending.set(id, { resolve: resolve2, reject, timer });
-      this.child.stdin.write(`${JSON.stringify({ method, id, params })}
-`);
-    });
-  }
-  notify(method, params) {
-    this.child.stdin.write(`${JSON.stringify({ method, params })}
-`);
-  }
-  async startThread(input2) {
-    const params = {
-      cwd: input2.cwd,
-      approvalPolicy: "never",
-      sandbox: input2.policy.mode === "read_only" ? "read-only" : "workspace-write",
-      serviceName: "codex-role-runtime"
-    };
-    if (input2.model) params.model = input2.model;
-    const result = await this.request("thread/start", params, 6e4);
-    const threadId = result?.thread?.id;
-    if (!threadId) throw new Error(`thread/start returned no thread id: ${JSON.stringify(result)}`);
-    await this.request("thread/name/set", { threadId, name: input2.name }).catch(() => void 0);
-    return threadId;
-  }
-  async resumeThread(threadId) {
-    const result = await this.request("thread/resume", { threadId }, 6e4);
-    if (result?.thread?.id !== threadId) throw new Error(`thread/resume returned the wrong thread: ${JSON.stringify(result)}`);
-  }
-  async threadExists(threadId) {
-    try {
-      const result = await this.request("thread/read", { threadId, includeTurns: false }, 6e4);
-      return result?.thread?.id === threadId;
-    } catch (error) {
-      if (isMissingThreadError(error)) return false;
-      throw error;
-    }
-  }
-  async runTurn(threadId, prompt, timeoutMs = 9e5) {
-    await this.resumeThread(threadId);
-    let lastText = "";
-    let cleanup = () => void 0;
-    const completed = new Promise((resolve2, reject) => {
-      const timer = setTimeout(() => {
-        cleanup();
-        reject(new Error("Role dispatch turn timed out."));
-      }, timeoutMs);
-      const listener = (message) => {
-        const params = message.params || {};
-        if (params.threadId && params.threadId !== threadId) return;
-        if (message.method === "app-server/exited") {
-          cleanup();
-          reject(new Error(params.error || "Codex app-server exited during role dispatch."));
-          return;
-        }
-        if (message.method === "item/agentMessage/delta") lastText += params.delta || "";
-        if (message.method === "item/completed" && params.item?.type === "agentMessage") lastText = params.item.text || lastText;
-        if (message.method === "turn/completed") {
-          cleanup();
-          if (params.turn?.status && !["completed", "Completed"].includes(params.turn.status)) {
-            reject(new Error(`Role dispatch turn ${params.turn.status}${params.turn?.error?.message ? `: ${params.turn.error.message}` : ""}`));
-          } else resolve2();
-        }
-      };
-      cleanup = () => {
-        clearTimeout(timer);
-        this.listeners.delete(listener);
-      };
-      this.listeners.add(listener);
-    });
-    try {
-      await this.request("turn/start", { threadId, input: [{ type: "text", text: prompt }] }, 6e4);
-      await completed;
-      return lastText.trim();
-    } catch (error) {
-      cleanup();
-      throw error;
-    }
-  }
-  close() {
-    this.lines.close();
-    if (this.child.exitCode !== null || this.child.killed) return;
-    this.child.stdin.end();
-    const timer = setTimeout(() => {
-      if (this.child.exitCode !== null) return;
-      if (process.platform === "win32" && this.child.pid) {
-        const killer = spawn("taskkill.exe", ["/pid", String(this.child.pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
-        killer.unref();
-      } else {
-        this.child.kill();
-      }
-    }, 2e3);
-    timer.unref();
-    this.child.once("exit", () => clearTimeout(timer));
-  }
-};
-
 // src/generation-service.ts
-async function activeTaskExists(active, options) {
-  if (options.taskExists) return options.taskExists(active.thread_id);
-  if (options.clientFactory) return true;
-  const client = await AppServerClient.connect();
-  try {
-    return await client.threadExists(active.thread_id);
-  } finally {
-    client.close();
-  }
-}
-function rotationIsFresh(rotation, maximumAgeMs = 12e4) {
-  const updated = Date.parse(String(rotation.updated_at || rotation.created_at || ""));
-  return Number.isFinite(updated) && Date.now() - updated <= maximumAgeMs;
-}
-async function replaceMissingActiveGeneration(store2, project, roleKey, missing, options) {
-  const current = store2.activeGeneration(project, roleKey);
-  if (!current || current.id !== missing.id) {
-    return { role: roleKey, status: current ? "active" : "starting", started: false, recovered: true, generation: current };
-  }
-  const candidate = store2.bootstrappingGeneration(project, roleKey);
-  const rotation = store2.openRotation(project, roleKey);
-  const sameRecovery = rotation && String(rotation.old_generation_id || "") === current.id;
-  if (rotation && sameRecovery && rotationIsFresh(rotation)) {
-    return candidate ? { role: roleKey, status: "bootstrapping", started: false, recovered: true, generation: candidate, rotation_id: rotation.id } : { role: roleKey, status: "starting", started: false, recovered: true, rotation_id: rotation.id };
-  }
-  if (candidate) store2.rejectCandidate(candidate.id, `Recovered stale bootstrap while replacing missing task ${current.thread_id}.`);
-  if (rotation) store2.updateRotation(String(rotation.id), "FAILED", { error: `Superseded while replacing missing active task ${current.thread_id}.` });
-  const result = await rotateRoleGeneration(store2, project, roleKey, `Active App Server task ${current.thread_id} no longer exists.`, options);
-  return { ...result, status: "active", started: true, recovered: true, replaced_generation: current };
-}
 function expectedBootstrap(store2, project, role) {
   const context2 = store2.context(project, role.role_key);
   const facts = context2.facts;
@@ -220,73 +14,47 @@ function expectedBootstrap(store2, project, role) {
     architecture_epoch: Number(context2.project.architecture_epoch)
   };
 }
-async function rotateRoleGeneration(store2, project, roleKey, reason, options = {}) {
+function completeAttachment(store2, project, roleKey, threadId, reason, rotation, candidate) {
   const role = store2.getRole(project, roleKey);
-  if (!role) throw new Error(`Unknown role: ${roleKey}`);
-  const rotation = store2.createRotation(project, roleKey, reason);
-  let client = null;
-  let candidate = null;
-  try {
-    client = options.clientFactory ? await options.clientFactory() : await AppServerClient.connect();
-    store2.updateRotation(String(rotation.id), "DRAINING");
-    store2.updateRotation(String(rotation.id), "CHECKPOINTING");
-    store2.updateRotation(String(rotation.id), "VALIDATING");
-    const threadId = await client.startThread({ cwd: project.root, ...options.model ? { model: options.model } : {}, policy: role.policy, name: `${role.name} \xB7 Generation` });
-    const expected = expectedBootstrap(store2, project, role);
-    candidate = store2.createCandidate(project, roleKey, threadId, JSON.stringify(expected));
-    store2.updateRotation(String(rotation.id), "BOOTSTRAPPING", { candidateId: candidate.id });
-    const validation = store2.validateBootstrap(project, roleKey, expected);
-    if (!validation.ok) {
-      store2.rejectCandidate(candidate.id, validation.errors.join("; "));
-      store2.updateRotation(String(rotation.id), "FAILED", { error: validation.errors.join("; ") });
-      throw new Error(`Bootstrap rejected: ${validation.errors.join("; ")}`);
-    }
-    store2.updateRotation(String(rotation.id), "CUTOVER");
-    const active = store2.activateCandidate(project, roleKey, candidate.id, reason);
-    store2.updateRotation(String(rotation.id), "COMPLETED");
-    return { rotation_id: rotation.id, role: roleKey, generation: active, validation };
-  } catch (error) {
-    if (candidate) {
-      try {
-        store2.rejectCandidate(candidate.id, `Bootstrap failed: ${error instanceof Error ? error.message : String(error)}`);
-      } catch {
-      }
-    }
-    try {
-      store2.updateRotation(String(rotation.id), "FAILED", { error: error instanceof Error ? error.message : String(error) });
-    } catch {
-    }
-    throw error;
-  } finally {
-    client?.close();
+  store2.updateRotation(String(rotation.id), "BOOTSTRAPPING", { candidateId: candidate.id });
+  const validation = store2.validateBootstrap(project, roleKey, expectedBootstrap(store2, project, role));
+  if (!validation.ok) {
+    store2.rejectCandidate(candidate.id, validation.errors.join("; "));
+    store2.updateRotation(String(rotation.id), "FAILED", { error: validation.errors.join("; ") });
+    throw new Error(`Bootstrap rejected: ${validation.errors.join("; ")}`);
   }
+  store2.updateRotation(String(rotation.id), "CUTOVER");
+  const generation = store2.activateCandidate(project, roleKey, candidate.id, reason);
+  store2.updateRotation(String(rotation.id), "COMPLETED");
+  return { role: roleKey, status: "active", attached: true, thread_id: threadId, rotation_id: rotation.id, generation, validation };
 }
-function handoffRoleGenerationToThread(store2, project, roleKey, threadId, reason) {
+function attachRoleThread(store2, project, roleKey, threadId, reason = "Attached by Codex desktop task orchestration.") {
   const role = store2.getRole(project, roleKey);
   if (!role) throw new Error(`Unknown role: ${roleKey}`);
   const active = store2.activeGeneration(project, roleKey);
-  if (active?.thread_id === threadId) return { role: roleKey, status: "active", handed_off: false, generation: active };
-  if (store2.getGenerationByThread(project, threadId)) throw new Error("THREAD_ALREADY_BOUND");
-  if (store2.bootstrappingGeneration(project, roleKey) || store2.openRotation(project, roleKey)) throw new Error("ROLE_ROTATION_ALREADY_IN_PROGRESS");
+  if (active?.thread_id === threadId) return { role: roleKey, status: "active", attached: false, thread_id: threadId, generation: active };
+  const bound = store2.getGenerationByThread(project, threadId);
+  if (bound && bound.role.role_key !== roleKey) throw new Error("THREAD_ALREADY_BOUND_TO_ANOTHER_ROLE");
+  const openCandidate = store2.bootstrappingGeneration(project, roleKey);
+  const openRotation = store2.openRotation(project, roleKey);
+  if (bound?.generation.status === "bootstrapping" && openCandidate?.id === bound.generation.id && openRotation) {
+    return completeAttachment(store2, project, roleKey, threadId, reason, openRotation, openCandidate);
+  }
+  if (bound) throw new Error("THREAD_ALREADY_BOUND_TO_RETIRED_GENERATION");
+  if (openCandidate) store2.rejectCandidate(openCandidate.id, `Superseded by desktop task ${threadId}.`);
+  if (openRotation) store2.updateRotation(String(openRotation.id), "FAILED", { error: `Superseded by desktop task ${threadId}.` });
   const rotation = store2.createRotation(project, roleKey, reason);
   let candidate = null;
   try {
     store2.updateRotation(String(rotation.id), "DRAINING");
     store2.updateRotation(String(rotation.id), "CHECKPOINTING");
     store2.updateRotation(String(rotation.id), "VALIDATING");
-    const expected = expectedBootstrap(store2, project, role);
-    candidate = store2.createCandidate(project, roleKey, threadId, JSON.stringify(expected));
-    store2.updateRotation(String(rotation.id), "BOOTSTRAPPING", { candidateId: candidate.id });
-    const validation = store2.validateBootstrap(project, roleKey, expected);
-    if (!validation.ok) throw new Error(`Bootstrap rejected: ${validation.errors.join("; ")}`);
-    store2.updateRotation(String(rotation.id), "CUTOVER");
-    const next = store2.activateCandidate(project, roleKey, candidate.id, reason);
-    store2.updateRotation(String(rotation.id), "COMPLETED");
-    return { rotation_id: rotation.id, role: roleKey, status: "active", handed_off: Boolean(active), generation: next, validation };
+    candidate = store2.createCandidate(project, roleKey, threadId, JSON.stringify(expectedBootstrap(store2, project, role)));
+    return completeAttachment(store2, project, roleKey, threadId, reason, rotation, candidate);
   } catch (error) {
     if (candidate) {
       try {
-        store2.rejectCandidate(candidate.id, `Existing-thread handoff failed: ${error instanceof Error ? error.message : String(error)}`);
+        store2.rejectCandidate(candidate.id, `Task attachment failed: ${error instanceof Error ? error.message : String(error)}`);
       } catch {
       }
     }
@@ -297,23 +65,10 @@ function handoffRoleGenerationToThread(store2, project, roleKey, threadId, reaso
     throw error;
   }
 }
-async function startRoleGeneration(store2, project, roleKey, options = {}) {
-  const active = store2.activeGeneration(project, roleKey);
-  if (active) {
-    if (await activeTaskExists(active, options)) return { role: roleKey, status: "active", started: false, generation: active };
-    return replaceMissingActiveGeneration(store2, project, roleKey, active, options);
-  }
-  const candidate = store2.bootstrappingGeneration(project, roleKey);
-  const rotation = store2.openRotation(project, roleKey);
-  if (candidate && rotation) return { role: roleKey, status: "bootstrapping", started: false, generation: candidate, rotation_id: rotation.id };
-  if (candidate) store2.rejectCandidate(candidate.id, "Recovered orphaned bootstrap candidate before retrying role_start.");
-  if (rotation) return { role: roleKey, status: "starting", started: false, rotation_id: rotation.id };
-  const result = await rotateRoleGeneration(store2, project, roleKey, "initial generation", options);
-  return { ...result, status: "active", started: true };
-}
+var handoffRoleGenerationToThread = attachRoleThread;
 
 // src/project.ts
-import { execFileSync as execFileSync2 } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 
@@ -374,7 +129,7 @@ function redact(value) {
 // src/project.ts
 function git(cwd, args) {
   try {
-    return execFileSync2("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() || null;
+    return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() || null;
   } catch {
     return null;
   }
@@ -1177,17 +932,10 @@ try {
       initializeStandardTopology(store, project);
       const active = store.activeGeneration(project, "liaison");
       const liaison = active ? handoffRoleGenerationToThread(store, project, "liaison", input.session_id, "User selected a new Liaison entry task with the exact initialization prompt.") : { handed_off: false, generation: store.bindInitial(project, "liaison", input.session_id) };
-      const testCoordinatorThread = process.env.CODEX_ROLE_RUNTIME_TEST_COORDINATOR_THREAD;
-      const coordinator = await startRoleGeneration(store, project, "coordinator", testCoordinatorThread ? {
-        clientFactory: async () => ({ async startThread() {
-          return testCoordinatorThread;
-        }, close() {
-        } })
-      } : {});
-      const action = liaison.handed_off ? "resumed and handed off" : "initialized";
-      process.stdout.write(JSON.stringify(context(input.hook_event_name, `Role orchestration ${action}. This task is now the user's communication entry point; role://coordinator status is ${coordinator.status}.
+      const action = active ? "resumed and handed off" : "initialized";
+      process.stdout.write(JSON.stringify(context(input.hook_event_name, `Role orchestration ${action}. This task is now the user's communication entry point.
 ${store.roleAnchor(project, "liaison")}
-Send structured user intent to role://coordinator; relay its questions, progress, blockers, and verified results back to the user.`)));
+Use Codex desktop task tools directly to list or read the Coordinator task. If it is missing, archived, deleted, or otherwise unavailable, create a new local task for this project and call role_attach with its task id. Do not use Codex CLI or App Server for task lifecycle operations. Then route structured user intent to role://coordinator and relay its questions, progress, blockers, and verified results back to the user.`)));
       process.exit(0);
     }
     const claim = input.prompt?.match(/^\s*role:\/\/bind\s+([a-z0-9-]+)\s*$/i);
