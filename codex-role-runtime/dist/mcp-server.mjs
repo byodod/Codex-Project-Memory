@@ -31082,6 +31082,289 @@ function resolveProject(input = process.cwd()) {
   };
 }
 
+// src/app-server.ts
+import { execFileSync as execFileSync2, spawn } from "node:child_process";
+import { createInterface } from "node:readline";
+function resolveCodexBinary() {
+  if (process.env.CODEX_BIN) {
+    return process.env.CODEX_BIN;
+  }
+  if (process.platform === "win32") {
+    try {
+      const candidates = execFileSync2("where.exe", ["codex.cmd"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+      if (candidates[0]) return candidates[0];
+    } catch {
+    }
+  }
+  return "codex";
+}
+var AppServerClient = class _AppServerClient {
+  child;
+  lines;
+  nextId = 1;
+  pending = /* @__PURE__ */ new Map();
+  listeners = /* @__PURE__ */ new Set();
+  stderr = [];
+  constructor(command = resolveCodexBinary()) {
+    this.child = spawn(command, ["app-server", "--stdio"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+      shell: process.platform === "win32" && !command.toLowerCase().endsWith(".exe")
+    });
+    this.lines = createInterface({ input: this.child.stdout });
+    this.lines.on("line", (line) => this.onLine(line));
+    this.child.stderr.setEncoding("utf8");
+    this.child.stderr.on("data", (chunk) => {
+      this.stderr.push(chunk);
+      if (this.stderr.length > 50) this.stderr.shift();
+    });
+    this.child.on("exit", (code) => {
+      for (const waiter of this.pending.values()) {
+        clearTimeout(waiter.timer);
+        waiter.reject(new Error(`Codex app-server exited with ${code}. ${this.stderr.join("").slice(-2e3)}`));
+      }
+      this.pending.clear();
+    });
+  }
+  static async connect() {
+    const client = new _AppServerClient();
+    await client.request("initialize", { clientInfo: { name: "codex-role-runtime", title: "Codex Role Runtime", version: "1.0.0" } });
+    client.notify("initialized", {});
+    return client;
+  }
+  onLine(line) {
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (typeof message.id === "number" && (message.result !== void 0 || message.error !== void 0)) {
+      const waiter = this.pending.get(message.id);
+      if (!waiter) return;
+      clearTimeout(waiter.timer);
+      this.pending.delete(message.id);
+      if (message.error) waiter.reject(new Error(`App Server RPC error: ${JSON.stringify(message.error)}`));
+      else waiter.resolve(message.result);
+      return;
+    }
+    for (const listener of this.listeners) listener(message);
+  }
+  request(method, params, timeoutMs = 3e4) {
+    const id = this.nextId++;
+    return new Promise((resolve2, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`App Server timeout: ${method}`));
+      }, timeoutMs);
+      this.pending.set(id, { resolve: resolve2, reject, timer });
+      this.child.stdin.write(`${JSON.stringify({ method, id, params })}
+`);
+    });
+  }
+  notify(method, params) {
+    this.child.stdin.write(`${JSON.stringify({ method, params })}
+`);
+  }
+  async startThread(input) {
+    const params = {
+      cwd: input.cwd,
+      approvalPolicy: "never",
+      sandbox: input.policy.mode === "read_only" ? "read-only" : "workspace-write",
+      serviceName: "codex-role-runtime"
+    };
+    if (input.model) params.model = input.model;
+    const result2 = await this.request("thread/start", params, 6e4);
+    const threadId = result2?.thread?.id;
+    if (!threadId) throw new Error(`thread/start returned no thread id: ${JSON.stringify(result2)}`);
+    await this.request("thread/name/set", { threadId, name: input.name }).catch(() => void 0);
+    return threadId;
+  }
+  async setGoal(threadId, objective) {
+    await this.request("thread/goal/set", { threadId, objective: objective.slice(0, 4e3), status: "active" });
+  }
+  async resumeThread(threadId) {
+    const result2 = await this.request("thread/resume", { threadId }, 6e4);
+    if (result2?.thread?.id !== threadId) throw new Error(`thread/resume returned the wrong thread: ${JSON.stringify(result2)}`);
+  }
+  async bootstrapHealth(threadId, expected, contextText) {
+    const outputSchema = {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        role_id: { type: "string" },
+        mission: { type: "string" },
+        owned_domains: { type: "array", items: { type: "string" } },
+        critical_invariants: { type: "array", items: { type: "string" } },
+        open_questions: { type: "array", items: { type: "string" } },
+        architecture_epoch: { type: "integer" }
+      },
+      required: ["role_id", "mission", "owned_domains", "critical_invariants", "open_questions", "architecture_epoch"]
+    };
+    let lastText = "";
+    const completed = new Promise((resolve2, reject) => {
+      const timer = setTimeout(() => {
+        this.listeners.delete(listener);
+        reject(new Error("Bootstrap health turn timed out."));
+      }, 18e4);
+      const listener = (message) => {
+        const params = message.params || {};
+        if (params.threadId && params.threadId !== threadId) return;
+        if (message.method === "item/agentMessage/delta") lastText += params.delta || "";
+        if (message.method === "item/completed" && params.item?.type === "agentMessage") lastText = params.item.text || lastText;
+        if (message.method === "turn/completed") {
+          clearTimeout(timer);
+          this.listeners.delete(listener);
+          if (params.turn?.status && !["completed", "Completed"].includes(params.turn.status)) reject(new Error(`Bootstrap turn ${params.turn.status}`));
+          else resolve2();
+        }
+      };
+      this.listeners.add(listener);
+    });
+    const prompt = [
+      "You are bootstrapping a persistent Codex role generation. Do not use tools and do not perform project work.",
+      "Return only the requested JSON, reproducing the authoritative values exactly.",
+      contextText,
+      `Expected values: ${JSON.stringify(expected)}`
+    ].join("\n\n");
+    await this.request("turn/start", { threadId, input: [{ type: "text", text: prompt }], outputSchema }, 6e4);
+    await completed;
+    try {
+      return JSON.parse(lastText);
+    } catch {
+      const match = lastText.match(/\{[\s\S]*\}/);
+      if (!match) throw new Error(`Bootstrap returned no JSON: ${lastText.slice(-2e3)}`);
+      return JSON.parse(match[0]);
+    }
+  }
+  async runTurn(threadId, prompt, timeoutMs = 9e5) {
+    await this.resumeThread(threadId);
+    let lastText = "";
+    const completed = new Promise((resolve2, reject) => {
+      const timer = setTimeout(() => {
+        this.listeners.delete(listener);
+        reject(new Error("Role dispatch turn timed out."));
+      }, timeoutMs);
+      const listener = (message) => {
+        const params = message.params || {};
+        if (params.threadId && params.threadId !== threadId) return;
+        if (message.method === "item/agentMessage/delta") lastText += params.delta || "";
+        if (message.method === "item/completed" && params.item?.type === "agentMessage") lastText = params.item.text || lastText;
+        if (message.method === "turn/completed") {
+          clearTimeout(timer);
+          this.listeners.delete(listener);
+          if (params.turn?.status && !["completed", "Completed"].includes(params.turn.status)) reject(new Error(`Role dispatch turn ${params.turn.status}`));
+          else resolve2();
+        }
+      };
+      this.listeners.add(listener);
+    });
+    await this.request("turn/start", { threadId, input: [{ type: "text", text: prompt }] }, 6e4);
+    await completed;
+    return lastText.trim();
+  }
+  close() {
+    this.lines.close();
+    this.child.stdin.end();
+    this.child.kill();
+  }
+};
+
+// src/generation-service.ts
+function expectedBootstrap(store, project, role) {
+  const context = store.context(project, role.role_key);
+  const facts = context.facts;
+  return {
+    role_id: role.role_key,
+    mission: role.mission,
+    owned_domains: role.owned_domains,
+    critical_invariants: facts.filter((fact) => fact.kind === "invariant").map((fact) => String(fact.content)),
+    open_questions: facts.filter((fact) => fact.kind === "open_question").map((fact) => String(fact.content)),
+    architecture_epoch: Number(context.project.architecture_epoch)
+  };
+}
+async function rotateRoleGeneration(store, project, roleKey, reason, options = {}) {
+  const role = store.getRole(project, roleKey);
+  if (!role) throw new Error(`Unknown role: ${roleKey}`);
+  const rotation = store.createRotation(project, roleKey, reason);
+  const client = await AppServerClient.connect();
+  try {
+    store.updateRotation(String(rotation.id), "DRAINING");
+    store.updateRotation(String(rotation.id), "CHECKPOINTING");
+    store.updateRotation(String(rotation.id), "VALIDATING");
+    const threadId = await client.startThread({ cwd: project.root, ...options.model ? { model: options.model } : {}, policy: role.policy, name: `${role.name} \xB7 Generation` });
+    const expected = expectedBootstrap(store, project, role);
+    const candidate = store.createCandidate(project, roleKey, threadId, JSON.stringify(expected));
+    store.updateRotation(String(rotation.id), "BOOTSTRAPPING", { candidateId: candidate.id });
+    await client.setGoal(threadId, `Act as ${role.name}: ${role.mission}`);
+    const actual = options.deterministicBootstrap ? expected : await client.bootstrapHealth(threadId, expected, store.roleAnchor(project, roleKey));
+    const validation = store.validateBootstrap(project, roleKey, actual);
+    if (!validation.ok) {
+      store.rejectCandidate(candidate.id, validation.errors.join("; "));
+      store.updateRotation(String(rotation.id), "FAILED", { error: validation.errors.join("; ") });
+      throw new Error(`Bootstrap rejected: ${validation.errors.join("; ")}`);
+    }
+    store.updateRotation(String(rotation.id), "CUTOVER");
+    const active = store.activateCandidate(project, roleKey, candidate.id, reason);
+    store.updateRotation(String(rotation.id), "COMPLETED");
+    return { rotation_id: rotation.id, role: roleKey, generation: active, validation };
+  } catch (error51) {
+    try {
+      store.updateRotation(String(rotation.id), "FAILED", { error: error51 instanceof Error ? error51.message : String(error51) });
+    } catch {
+    }
+    throw error51;
+  } finally {
+    client.close();
+  }
+}
+async function dispatchLiaisonRequest(store, project, input) {
+  const liaison = store.getRole(project, "liaison");
+  const coordinator = store.getRole(project, "coordinator");
+  if (!liaison || !coordinator) throw new Error("STANDARD_TOPOLOGY_NOT_INITIALIZED");
+  store.assertCurrent(liaison, input.liaison_generation);
+  const coordinatorGeneration = store.activeGeneration(project, "coordinator");
+  if (!coordinatorGeneration) throw new Error("COORDINATOR_NOT_ACTIVE: call role_start for role://coordinator first");
+  const architectureEpoch = store.projectEpoch(project);
+  const requestInput = {
+    ...input.message_id ? { message_id: input.message_id } : {},
+    type: "ASSIGN",
+    from_role: "liaison",
+    to_role: "coordinator",
+    from_generation: input.liaison_generation,
+    ...input.task_id ? { task_id: input.task_id } : {},
+    scope: input.scope || "",
+    architecture_epoch: architectureEpoch,
+    payload: { user_request: input.request }
+  };
+  const requestMessage = store.sendMessage(project, requestInput);
+  store.inbox(project, "coordinator");
+  const client = await AppServerClient.connect();
+  try {
+    const responseText = await client.runTurn(coordinatorGeneration.thread_id, [
+      store.roleAnchor(project, "coordinator"),
+      "A request arrived from role://liaison. Coordinate the internal work needed to answer it. Use durable tasks and typed role messages when useful.",
+      "Return a concise response for role://liaison containing questions, progress, blockers, decisions needed, or verified results. Do not address the user directly.",
+      `Request message: ${JSON.stringify({ id: requestMessage.id, task_id: requestMessage.task_id, scope: requestMessage.scope, payload: { user_request: input.request } })}`
+    ].join("\n\n"));
+    const resultMessage = store.sendMessage(project, {
+      type: "RESULT",
+      from_role: "coordinator",
+      to_role: "liaison",
+      from_generation: coordinatorGeneration.generation_number,
+      ...input.task_id ? { task_id: input.task_id } : {},
+      scope: input.scope || "",
+      architecture_epoch: store.projectEpoch(project),
+      payload: { response: responseText },
+      reply_to: String(requestMessage.id)
+    });
+    store.acknowledgeMessage(project, "coordinator", String(requestMessage.id));
+    return { request_message: requestMessage, result_message: resultMessage, response: responseText };
+  } finally {
+    client.close();
+  }
+}
+
 // src/store.ts
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
@@ -31485,6 +31768,9 @@ var RoleStore = class {
     const from = this.getRole(project, input.from_role);
     const to = this.getRole(project, input.to_role);
     if (!from || !to) throw new Error("UNKNOWN_MESSAGE_ROLE");
+    if ((from.role_key === "liaison" || to.role_key === "liaison") && from.role_key !== "coordinator" && to.role_key !== "coordinator") {
+      throw new Error("LIAISON_ROUTE_REQUIRES_COORDINATOR");
+    }
     this.assertCurrent(from, input.from_generation);
     if (input.architecture_epoch !== this.projectEpoch(project)) throw new Error("STALE_ARCHITECTURE_EPOCH");
     const id = input.message_id || newId("msg");
@@ -31655,6 +31941,7 @@ var RoleStore = class {
     const facts = context.facts;
     const invariants = facts.filter((fact) => fact.kind === "invariant").slice(0, 8);
     const tasks = context.tasks;
+    const interactionContract = role.role_key === "liaison" ? "Interaction contract: you are the user's sole conversational entry point. Clarify intent, send structured requests and decisions to role://coordinator, and translate its questions, progress, blockers, and verified results for the user. Do not perform internal coordination or implementation yourself." : role.role_key === "coordinator" ? "Interaction contract: receive user intent from role://liaison and return questions, progress, blockers, and results through role://liaison; do not require the user to contact internal roles." : "Interaction contract: communicate user-facing questions and results through role://coordinator, which routes them through role://liaison.";
     return [
       "[Codex Role Runtime]",
       `Role: ${role.name} (role://${role.role_key})`,
@@ -31666,6 +31953,7 @@ var RoleStore = class {
       `Active tasks: ${tasks.map((task) => `${task.id}:${task.title}`).join(" | ") || "none"}`,
       `Critical invariants: ${invariants.map((fact) => fact.content).join(" | ") || "none recorded"}`,
       `Pending typed messages: ${context.pending_messages}`,
+      interactionContract,
       "Address other persistent roles by role:// key. Never treat this thread id as the role identity."
     ].join("\n");
   }
@@ -31681,6 +31969,64 @@ var RoleStore = class {
     return { project: { ...project, architecture_epoch: Number(projectRow.architecture_epoch), constitution: projectRow.constitution }, roles: this.listRoles(project), counts, open_rotations: rotations, database_path: this.databasePath };
   }
 };
+
+// src/topology.ts
+var STANDARD_CONSTITUTION = "Preserve modular boundaries, route user communication through the Liaison, route project work through the Coordinator, route cross-domain decisions through semantic owners, and require independent verification.";
+var STANDARD_ROLES = [
+  {
+    role_key: "liaison",
+    name: "User Liaison",
+    kind: "governance",
+    mission: "Serve as the user's conversational gateway: clarify intent, preserve user decisions, translate requests into structured messages for role://coordinator, and relay questions, progress, blockers, and verified results in user-facing language.",
+    owned_domains: ["user communication", "intent clarification", "user decisions", "status synthesis"],
+    excluded_domains: ["project scheduling", "architecture", "implementation", "verification"],
+    escalation_rules: ["Route all internal work through role://coordinator", "Ask the user only when a decision materially changes scope, risk, cost, or outcome"],
+    policy: { mode: "read_only", canDelegateTo: ["coordinator"] }
+  },
+  {
+    role_key: "coordinator",
+    name: "Coordinator",
+    kind: "governance",
+    mission: "Maintain project goal, task graph, dependencies, role directory, blockers, and routing without absorbing all module knowledge.",
+    owned_domains: ["project goal", "task graph", "routing", "milestones"],
+    excluded_domains: ["user-facing conversation", "implementation", "module internals"],
+    escalation_rules: ["Exchange user requests, questions, and results only through role://liaison", "Architecture changes go to role://architect"],
+    policy: { mode: "read_only", canDelegateTo: ["architect", "verifier"] }
+  },
+  {
+    role_key: "architect",
+    name: "Architect",
+    kind: "governance",
+    mission: "Protect system structure, semantic ownership, dependency direction, cross-module contracts, and migrations.",
+    owned_domains: ["architecture", "module boundaries", "dependency direction", "cross-module contracts"],
+    excluded_domains: ["user-facing conversation", "routine implementation"],
+    escalation_rules: ["Product-direction decisions return to role://coordinator and role://liaison"],
+    policy: { mode: "read_only", canDelegateTo: ["verifier"] }
+  },
+  {
+    role_key: "verifier",
+    name: "Verifier",
+    kind: "governance",
+    mission: "Independently verify requirements, architecture consistency, actual diff scope, and objective test evidence.",
+    owned_domains: ["verification", "acceptance", "diff review"],
+    excluded_domains: ["user-facing conversation", "implementation"],
+    escalation_rules: ["Reject unverifiable or out-of-scope changes and report through role://coordinator"],
+    policy: { mode: "read_only", freshVerification: true }
+  }
+];
+function initializeStandardTopology(store, project, constitution) {
+  const existing = store.ensureProject(project);
+  if (constitution !== void 0 || !String(existing.constitution || "").trim()) {
+    store.configureProject(project, constitution ?? STANDARD_CONSTITUTION);
+  }
+  const roles = STANDARD_ROLES.map((role) => store.defineRole(project, role));
+  return {
+    project: store.configureProject(project),
+    entry_role: "liaison",
+    coordinator_role: "coordinator",
+    roles
+  };
+}
 
 // src/types.ts
 var ROLE_KINDS = ["governance", "owner", "worker"];
@@ -31723,6 +32069,14 @@ function run(workingDirectory, action) {
     store.close();
   }
 }
+async function runAsync(workingDirectory, action) {
+  const store = new RoleStore();
+  try {
+    return result(await action(store, resolveProject(workingDirectory || process.cwd())));
+  } finally {
+    store.close();
+  }
+}
 function tool(name, config2, callback) {
   server.registerTool(name, {
     ...config2,
@@ -31741,6 +32095,12 @@ tool("project_configure", {
   inputSchema: { cwd, constitution: external_exports.string().max(12e3) },
   annotations: { readOnlyHint: false, idempotentHint: true }
 }, ({ cwd: cwd2, constitution }) => run(cwd2, (store, project) => store.configureProject(project, constitution)));
+tool("project_initialize", {
+  title: "Initialize standard role orchestration",
+  description: "Idempotently create the User Liaison, Coordinator, Architect, and Verifier topology. Hook-based initialization also binds the current task to the User Liaison.",
+  inputSchema: { cwd, constitution: external_exports.string().max(12e3).optional() },
+  annotations: { readOnlyHint: false, idempotentHint: true }
+}, ({ cwd: cwd2, constitution }) => run(cwd2, (store, project) => initializeStandardTopology(store, project, constitution)));
 tool("role_define", {
   title: "Define persistent role",
   description: "Create or update a durable role charter, semantic ownership, escalation rules, and enforcement policy.",
@@ -31775,6 +32135,15 @@ tool("role_bind", {
   inputSchema: { cwd, role_key: external_exports.string(), thread_id: external_exports.string().min(1) },
   annotations: { readOnlyHint: false, idempotentHint: true }
 }, ({ cwd: cwd2, role_key, thread_id }) => run(cwd2, (store, project) => store.bindInitial(project, role_key, thread_id)));
+tool("role_start", {
+  title: "Start initial role task",
+  description: "Create and validate the first Codex task generation for a standard role through App Server. Use this to start the Coordinator after one-prompt initialization.",
+  inputSchema: { cwd, role_key: external_exports.string(), model: external_exports.string().optional() },
+  annotations: { readOnlyHint: false, idempotentHint: false }
+}, ({ cwd: cwd2, role_key, model }) => runAsync(cwd2, async (store, project) => {
+  if (store.activeGeneration(project, role_key)) throw new Error("ROLE_ALREADY_HAS_ACTIVE_GENERATION");
+  return rotateRoleGeneration(store, project, role_key, "initial generation", { ...model ? { model } : {} });
+}));
 tool("role_context_get", {
   title: "Get layered role context",
   description: "Read the L0 constitution, L1 charter/state, active L2 tasks, generation, epoch, and pending mailbox count.",
@@ -31855,6 +32224,19 @@ tool("message_ack", {
   inputSchema: { cwd, role_key: external_exports.string(), message_id: external_exports.string() },
   annotations: { readOnlyHint: false, idempotentHint: true }
 }, ({ cwd: cwd2, role_key, message_id }) => run(cwd2, (store, project) => store.acknowledgeMessage(project, role_key, message_id)));
+tool("liaison_request", {
+  title: "Send user request through Coordinator",
+  description: "Send a user request from the active Liaison generation, wake the active Coordinator task, wait for its response, and persist the response back to the Liaison mailbox.",
+  inputSchema: {
+    cwd,
+    liaison_generation: external_exports.number().int().positive(),
+    request: external_exports.string().min(1).max(2e4),
+    task_id: external_exports.string().optional(),
+    scope: external_exports.string().max(2e3).optional(),
+    message_id: external_exports.string().optional()
+  },
+  annotations: { readOnlyHint: false, idempotentHint: false }
+}, ({ cwd: cwd2, ...input }) => runAsync(cwd2, (store, project) => dispatchLiaisonRequest(store, project, input)));
 tool("architecture_advance", {
   title: "Advance architecture epoch",
   description: "Invalidate work packets from the old architecture after an accepted material architecture change.",

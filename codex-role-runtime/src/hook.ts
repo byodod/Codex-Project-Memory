@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { resolveProject } from "./project.js";
 import { RoleStore } from "./store.js";
+import { initializeStandardTopology, isRoleInitializationPrompt } from "./topology.js";
 import { HookInput } from "./types.js";
 import { matchesAny, redact } from "./util.js";
 
@@ -32,6 +33,17 @@ try {
   let binding = store.getGenerationByThread(project, input.session_id);
 
   if (!binding && input.hook_event_name === "UserPromptSubmit") {
+    if (isRoleInitializationPrompt(input.prompt)) {
+      initializeStandardTopology(store, project);
+      const active = store.activeGeneration(project, "liaison");
+      if (active && active.thread_id !== input.session_id) {
+        process.stdout.write(JSON.stringify(deny(input.hook_event_name, "USER_LIAISON_ALREADY_ACTIVE: continue the existing User Liaison task, or rotate role://liaison before binding this task.")));
+        process.exit(0);
+      }
+      const generation = store.bindInitial(project, "liaison", input.session_id);
+      process.stdout.write(JSON.stringify(context(input.hook_event_name, `Role orchestration initialized. This task is the user's communication entry point.\n${store.roleAnchor(project, "liaison")}\nSend structured user intent to role://coordinator; relay its questions, progress, blockers, and verified results back to the user.`)));
+      process.exit(0);
+    }
     const claim = input.prompt?.match(/^\s*role:\/\/bind\s+([a-z0-9-]+)\s*$/i);
     if (claim?.[1]) {
       const generation = store.bindInitial(project, claim[1], input.session_id);

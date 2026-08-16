@@ -514,6 +514,9 @@ var RoleStore = class {
     const from = this.getRole(project, input.from_role);
     const to = this.getRole(project, input.to_role);
     if (!from || !to) throw new Error("UNKNOWN_MESSAGE_ROLE");
+    if ((from.role_key === "liaison" || to.role_key === "liaison") && from.role_key !== "coordinator" && to.role_key !== "coordinator") {
+      throw new Error("LIAISON_ROUTE_REQUIRES_COORDINATOR");
+    }
     this.assertCurrent(from, input.from_generation);
     if (input.architecture_epoch !== this.projectEpoch(project)) throw new Error("STALE_ARCHITECTURE_EPOCH");
     const id = input.message_id || newId("msg");
@@ -684,6 +687,7 @@ var RoleStore = class {
     const facts = context.facts;
     const invariants = facts.filter((fact) => fact.kind === "invariant").slice(0, 8);
     const tasks = context.tasks;
+    const interactionContract = role.role_key === "liaison" ? "Interaction contract: you are the user's sole conversational entry point. Clarify intent, send structured requests and decisions to role://coordinator, and translate its questions, progress, blockers, and verified results for the user. Do not perform internal coordination or implementation yourself." : role.role_key === "coordinator" ? "Interaction contract: receive user intent from role://liaison and return questions, progress, blockers, and results through role://liaison; do not require the user to contact internal roles." : "Interaction contract: communicate user-facing questions and results through role://coordinator, which routes them through role://liaison.";
     return [
       "[Codex Role Runtime]",
       `Role: ${role.name} (role://${role.role_key})`,
@@ -695,6 +699,7 @@ var RoleStore = class {
       `Active tasks: ${tasks.map((task) => `${task.id}:${task.title}`).join(" | ") || "none"}`,
       `Critical invariants: ${invariants.map((fact) => fact.content).join(" | ") || "none recorded"}`,
       `Pending typed messages: ${context.pending_messages}`,
+      interactionContract,
       "Address other persistent roles by role:// key. Never treat this thread id as the role identity."
     ].join("\n");
   }
@@ -710,6 +715,69 @@ var RoleStore = class {
     return { project: { ...project, architecture_epoch: Number(projectRow.architecture_epoch), constitution: projectRow.constitution }, roles: this.listRoles(project), counts, open_rotations: rotations, database_path: this.databasePath };
   }
 };
+
+// src/topology.ts
+var STANDARD_CONSTITUTION = "Preserve modular boundaries, route user communication through the Liaison, route project work through the Coordinator, route cross-domain decisions through semantic owners, and require independent verification.";
+var STANDARD_ROLES = [
+  {
+    role_key: "liaison",
+    name: "User Liaison",
+    kind: "governance",
+    mission: "Serve as the user's conversational gateway: clarify intent, preserve user decisions, translate requests into structured messages for role://coordinator, and relay questions, progress, blockers, and verified results in user-facing language.",
+    owned_domains: ["user communication", "intent clarification", "user decisions", "status synthesis"],
+    excluded_domains: ["project scheduling", "architecture", "implementation", "verification"],
+    escalation_rules: ["Route all internal work through role://coordinator", "Ask the user only when a decision materially changes scope, risk, cost, or outcome"],
+    policy: { mode: "read_only", canDelegateTo: ["coordinator"] }
+  },
+  {
+    role_key: "coordinator",
+    name: "Coordinator",
+    kind: "governance",
+    mission: "Maintain project goal, task graph, dependencies, role directory, blockers, and routing without absorbing all module knowledge.",
+    owned_domains: ["project goal", "task graph", "routing", "milestones"],
+    excluded_domains: ["user-facing conversation", "implementation", "module internals"],
+    escalation_rules: ["Exchange user requests, questions, and results only through role://liaison", "Architecture changes go to role://architect"],
+    policy: { mode: "read_only", canDelegateTo: ["architect", "verifier"] }
+  },
+  {
+    role_key: "architect",
+    name: "Architect",
+    kind: "governance",
+    mission: "Protect system structure, semantic ownership, dependency direction, cross-module contracts, and migrations.",
+    owned_domains: ["architecture", "module boundaries", "dependency direction", "cross-module contracts"],
+    excluded_domains: ["user-facing conversation", "routine implementation"],
+    escalation_rules: ["Product-direction decisions return to role://coordinator and role://liaison"],
+    policy: { mode: "read_only", canDelegateTo: ["verifier"] }
+  },
+  {
+    role_key: "verifier",
+    name: "Verifier",
+    kind: "governance",
+    mission: "Independently verify requirements, architecture consistency, actual diff scope, and objective test evidence.",
+    owned_domains: ["verification", "acceptance", "diff review"],
+    excluded_domains: ["user-facing conversation", "implementation"],
+    escalation_rules: ["Reject unverifiable or out-of-scope changes and report through role://coordinator"],
+    policy: { mode: "read_only", freshVerification: true }
+  }
+];
+function isRoleInitializationPrompt(prompt) {
+  if (!prompt) return false;
+  const normalized = prompt.trim().replace(/[。.!！]+$/u, "").trim().toLowerCase();
+  return normalized === "\u521D\u59CB\u5316\u89D2\u8272\u7F16\u6392" || normalized === "\u542F\u52A8\u89D2\u8272\u7F16\u6392" || normalized === "initialize role orchestration";
+}
+function initializeStandardTopology(store, project, constitution) {
+  const existing = store.ensureProject(project);
+  if (constitution !== void 0 || !String(existing.constitution || "").trim()) {
+    store.configureProject(project, constitution ?? STANDARD_CONSTITUTION);
+  }
+  const roles = STANDARD_ROLES.map((role) => store.defineRole(project, role));
+  return {
+    project: store.configureProject(project),
+    entry_role: "liaison",
+    coordinator_role: "coordinator",
+    roles
+  };
+}
 
 // src/app-server.ts
 import { execFileSync as execFileSync2, spawn } from "node:child_process";
@@ -812,6 +880,10 @@ var AppServerClient = class _AppServerClient {
   async setGoal(threadId, objective) {
     await this.request("thread/goal/set", { threadId, objective: objective.slice(0, 4e3), status: "active" });
   }
+  async resumeThread(threadId) {
+    const result = await this.request("thread/resume", { threadId }, 6e4);
+    if (result?.thread?.id !== threadId) throw new Error(`thread/resume returned the wrong thread: ${JSON.stringify(result)}`);
+  }
   async bootstrapHealth(threadId, expected, contextText) {
     const outputSchema = {
       type: "object",
@@ -862,12 +934,133 @@ var AppServerClient = class _AppServerClient {
       return JSON.parse(match[0]);
     }
   }
+  async runTurn(threadId, prompt, timeoutMs = 9e5) {
+    await this.resumeThread(threadId);
+    let lastText = "";
+    const completed = new Promise((resolve2, reject) => {
+      const timer = setTimeout(() => {
+        this.listeners.delete(listener);
+        reject(new Error("Role dispatch turn timed out."));
+      }, timeoutMs);
+      const listener = (message) => {
+        const params = message.params || {};
+        if (params.threadId && params.threadId !== threadId) return;
+        if (message.method === "item/agentMessage/delta") lastText += params.delta || "";
+        if (message.method === "item/completed" && params.item?.type === "agentMessage") lastText = params.item.text || lastText;
+        if (message.method === "turn/completed") {
+          clearTimeout(timer);
+          this.listeners.delete(listener);
+          if (params.turn?.status && !["completed", "Completed"].includes(params.turn.status)) reject(new Error(`Role dispatch turn ${params.turn.status}`));
+          else resolve2();
+        }
+      };
+      this.listeners.add(listener);
+    });
+    await this.request("turn/start", { threadId, input: [{ type: "text", text: prompt }] }, 6e4);
+    await completed;
+    return lastText.trim();
+  }
   close() {
     this.lines.close();
     this.child.stdin.end();
     this.child.kill();
   }
 };
+
+// src/generation-service.ts
+function expectedBootstrap(store, project, role) {
+  const context = store.context(project, role.role_key);
+  const facts = context.facts;
+  return {
+    role_id: role.role_key,
+    mission: role.mission,
+    owned_domains: role.owned_domains,
+    critical_invariants: facts.filter((fact) => fact.kind === "invariant").map((fact) => String(fact.content)),
+    open_questions: facts.filter((fact) => fact.kind === "open_question").map((fact) => String(fact.content)),
+    architecture_epoch: Number(context.project.architecture_epoch)
+  };
+}
+async function rotateRoleGeneration(store, project, roleKey, reason, options = {}) {
+  const role = store.getRole(project, roleKey);
+  if (!role) throw new Error(`Unknown role: ${roleKey}`);
+  const rotation = store.createRotation(project, roleKey, reason);
+  const client = await AppServerClient.connect();
+  try {
+    store.updateRotation(String(rotation.id), "DRAINING");
+    store.updateRotation(String(rotation.id), "CHECKPOINTING");
+    store.updateRotation(String(rotation.id), "VALIDATING");
+    const threadId = await client.startThread({ cwd: project.root, ...options.model ? { model: options.model } : {}, policy: role.policy, name: `${role.name} \xB7 Generation` });
+    const expected = expectedBootstrap(store, project, role);
+    const candidate = store.createCandidate(project, roleKey, threadId, JSON.stringify(expected));
+    store.updateRotation(String(rotation.id), "BOOTSTRAPPING", { candidateId: candidate.id });
+    await client.setGoal(threadId, `Act as ${role.name}: ${role.mission}`);
+    const actual = options.deterministicBootstrap ? expected : await client.bootstrapHealth(threadId, expected, store.roleAnchor(project, roleKey));
+    const validation = store.validateBootstrap(project, roleKey, actual);
+    if (!validation.ok) {
+      store.rejectCandidate(candidate.id, validation.errors.join("; "));
+      store.updateRotation(String(rotation.id), "FAILED", { error: validation.errors.join("; ") });
+      throw new Error(`Bootstrap rejected: ${validation.errors.join("; ")}`);
+    }
+    store.updateRotation(String(rotation.id), "CUTOVER");
+    const active = store.activateCandidate(project, roleKey, candidate.id, reason);
+    store.updateRotation(String(rotation.id), "COMPLETED");
+    return { rotation_id: rotation.id, role: roleKey, generation: active, validation };
+  } catch (error) {
+    try {
+      store.updateRotation(String(rotation.id), "FAILED", { error: error instanceof Error ? error.message : String(error) });
+    } catch {
+    }
+    throw error;
+  } finally {
+    client.close();
+  }
+}
+async function dispatchLiaisonRequest(store, project, input) {
+  const liaison = store.getRole(project, "liaison");
+  const coordinator = store.getRole(project, "coordinator");
+  if (!liaison || !coordinator) throw new Error("STANDARD_TOPOLOGY_NOT_INITIALIZED");
+  store.assertCurrent(liaison, input.liaison_generation);
+  const coordinatorGeneration = store.activeGeneration(project, "coordinator");
+  if (!coordinatorGeneration) throw new Error("COORDINATOR_NOT_ACTIVE: call role_start for role://coordinator first");
+  const architectureEpoch = store.projectEpoch(project);
+  const requestInput = {
+    ...input.message_id ? { message_id: input.message_id } : {},
+    type: "ASSIGN",
+    from_role: "liaison",
+    to_role: "coordinator",
+    from_generation: input.liaison_generation,
+    ...input.task_id ? { task_id: input.task_id } : {},
+    scope: input.scope || "",
+    architecture_epoch: architectureEpoch,
+    payload: { user_request: input.request }
+  };
+  const requestMessage = store.sendMessage(project, requestInput);
+  store.inbox(project, "coordinator");
+  const client = await AppServerClient.connect();
+  try {
+    const responseText = await client.runTurn(coordinatorGeneration.thread_id, [
+      store.roleAnchor(project, "coordinator"),
+      "A request arrived from role://liaison. Coordinate the internal work needed to answer it. Use durable tasks and typed role messages when useful.",
+      "Return a concise response for role://liaison containing questions, progress, blockers, decisions needed, or verified results. Do not address the user directly.",
+      `Request message: ${JSON.stringify({ id: requestMessage.id, task_id: requestMessage.task_id, scope: requestMessage.scope, payload: { user_request: input.request } })}`
+    ].join("\n\n"));
+    const resultMessage = store.sendMessage(project, {
+      type: "RESULT",
+      from_role: "coordinator",
+      to_role: "liaison",
+      from_generation: coordinatorGeneration.generation_number,
+      ...input.task_id ? { task_id: input.task_id } : {},
+      scope: input.scope || "",
+      architecture_epoch: store.projectEpoch(project),
+      payload: { response: responseText },
+      reply_to: String(requestMessage.id)
+    });
+    store.acknowledgeMessage(project, "coordinator", String(requestMessage.id));
+    return { request_message: requestMessage, result_message: resultMessage, response: responseText };
+  } finally {
+    client.close();
+  }
+}
 export {
   AppServerClient,
   FACT_KINDS,
@@ -875,7 +1068,13 @@ export {
   MESSAGE_TYPES,
   ROLE_KINDS,
   RoleStore,
+  STANDARD_CONSTITUTION,
+  STANDARD_ROLES,
   compactText,
+  dispatchLiaisonRequest,
+  expectedBootstrap,
+  initializeStandardTopology,
+  isRoleInitializationPrompt,
   matchesAny,
   newId,
   nowIso,
@@ -883,6 +1082,7 @@ export {
   redact,
   resolveCodexBinary,
   resolveProject,
+  rotateRoleGeneration,
   slug,
   stableHash,
   stableId,

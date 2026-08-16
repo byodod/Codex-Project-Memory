@@ -87,6 +87,11 @@ export class AppServerClient {
     await this.request("thread/goal/set", { threadId, objective: objective.slice(0, 4000), status: "active" });
   }
 
+  async resumeThread(threadId: string): Promise<void> {
+    const result = await this.request("thread/resume", { threadId }, 60_000);
+    if (result?.thread?.id !== threadId) throw new Error(`thread/resume returned the wrong thread: ${JSON.stringify(result)}`);
+  }
+
   async bootstrapHealth(threadId: string, expected: BootstrapResponse, contextText: string): Promise<BootstrapResponse> {
     const outputSchema = {
       type: "object", additionalProperties: false,
@@ -125,6 +130,29 @@ export class AppServerClient {
       const match = lastText.match(/\{[\s\S]*\}/); if (!match) throw new Error(`Bootstrap returned no JSON: ${lastText.slice(-2000)}`);
       return JSON.parse(match[0]) as BootstrapResponse;
     }
+  }
+
+  async runTurn(threadId: string, prompt: string, timeoutMs = 900_000): Promise<string> {
+    await this.resumeThread(threadId);
+    let lastText = "";
+    const completed = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => { this.listeners.delete(listener); reject(new Error("Role dispatch turn timed out.")); }, timeoutMs);
+      const listener = (message: Rpc) => {
+        const params = message.params || {};
+        if (params.threadId && params.threadId !== threadId) return;
+        if (message.method === "item/agentMessage/delta") lastText += params.delta || "";
+        if (message.method === "item/completed" && params.item?.type === "agentMessage") lastText = params.item.text || lastText;
+        if (message.method === "turn/completed") {
+          clearTimeout(timer); this.listeners.delete(listener);
+          if (params.turn?.status && !["completed", "Completed"].includes(params.turn.status)) reject(new Error(`Role dispatch turn ${params.turn.status}`));
+          else resolve();
+        }
+      };
+      this.listeners.add(listener);
+    });
+    await this.request("turn/start", { threadId, input: [{ type: "text", text: prompt }] }, 60_000);
+    await completed;
+    return lastText.trim();
   }
 
   close(): void { this.lines.close(); this.child.stdin.end(); this.child.kill(); }

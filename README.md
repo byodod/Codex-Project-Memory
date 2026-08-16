@@ -3,7 +3,7 @@
 这个仓库包含两款互补的 Codex 原生插件：
 
 - [Codex Project Memory](./codex-project-memory/README.md)：保存跨压缩、恢复和交接的项目任务记忆、工程事实与验证证据。
-- [Codex Role Runtime](./codex-role-runtime/README.md)：让持久角色独立于可替换会话，提供角色固定、typed mailbox、任务图、权限策略和安全换代。
+- [Codex Role Runtime](./codex-role-runtime/README.md)：用一句“初始化角色编排”建立用户联络者与内部协调者，让持久角色独立于可替换会话，并提供 typed mailbox、任务图、权限策略和安全换代。
 
 ## Project Memory
 
@@ -30,6 +30,8 @@ npm test
 ```
 
 Role Runtime 把 `Project / Role / Responsibility / State` 作为长期实体，把 Codex Thread 作为可退休、可替换的 Generation。它通过 SQLite 硬约束、MCP、Hooks 和 Codex App Server 实现角色路由、旧代拒绝、压缩健康和原子换代。
+
+安装并重启 Codex 后，在项目的新任务中只需发送 `初始化角色编排`。当前任务会成为用户联络者，内部协调者由插件启动；之后用户始终通过这个联络者沟通。
 
 ## 参考与致谢
 

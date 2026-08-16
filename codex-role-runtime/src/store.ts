@@ -390,6 +390,9 @@ export class RoleStore {
   sendMessage(project: ProjectContext, input: SendMessageInput): Row {
     const from = this.getRole(project, input.from_role); const to = this.getRole(project, input.to_role);
     if (!from || !to) throw new Error("UNKNOWN_MESSAGE_ROLE");
+    if ((from.role_key === "liaison" || to.role_key === "liaison") && from.role_key !== "coordinator" && to.role_key !== "coordinator") {
+      throw new Error("LIAISON_ROUTE_REQUIRES_COORDINATOR");
+    }
     this.assertCurrent(from, input.from_generation);
     if (input.architecture_epoch !== this.projectEpoch(project)) throw new Error("STALE_ARCHITECTURE_EPOCH");
     const id = input.message_id || newId("msg"); const time = nowIso();
@@ -520,6 +523,11 @@ export class RoleStore {
     const generation = context.active_generation as GenerationRecord | null;
     const facts = context.facts as Row[]; const invariants = facts.filter((fact) => fact.kind === "invariant").slice(0, 8);
     const tasks = context.tasks as Row[];
+    const interactionContract = role.role_key === "liaison"
+      ? "Interaction contract: you are the user's sole conversational entry point. Clarify intent, send structured requests and decisions to role://coordinator, and translate its questions, progress, blockers, and verified results for the user. Do not perform internal coordination or implementation yourself."
+      : role.role_key === "coordinator"
+        ? "Interaction contract: receive user intent from role://liaison and return questions, progress, blockers, and results through role://liaison; do not require the user to contact internal roles."
+        : "Interaction contract: communicate user-facing questions and results through role://coordinator, which routes them through role://liaison.";
     return [
       "[Codex Role Runtime]",
       `Role: ${role.name} (role://${role.role_key})`,
@@ -531,6 +539,7 @@ export class RoleStore {
       `Active tasks: ${tasks.map((task) => `${task.id}:${task.title}`).join(" | ") || "none"}`,
       `Critical invariants: ${invariants.map((fact) => fact.content).join(" | ") || "none recorded"}`,
       `Pending typed messages: ${context.pending_messages}`,
+      interactionContract,
       "Address other persistent roles by role:// key. Never treat this thread id as the role identity."
     ].join("\n");
   }

@@ -2,7 +2,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { resolveProject } from "./project.js";
+import { dispatchLiaisonRequest, rotateRoleGeneration } from "./generation-service.js";
 import { RoleStore } from "./store.js";
+import { initializeStandardTopology } from "./topology.js";
 import { FACT_KINDS, MESSAGE_TYPES, ROLE_KINDS } from "./types.js";
 
 const server = new McpServer({ name: "codex-role-runtime", version: "1.0.0" });
@@ -14,6 +16,10 @@ function result(value: unknown) {
 function run<T>(workingDirectory: string | undefined, action: (store: RoleStore, project: ReturnType<typeof resolveProject>) => T) {
   const store = new RoleStore();
   try { return result(action(store, resolveProject(workingDirectory || process.cwd()))); } finally { store.close(); }
+}
+async function runAsync<T>(workingDirectory: string | undefined, action: (store: RoleStore, project: ReturnType<typeof resolveProject>) => Promise<T>) {
+  const store = new RoleStore();
+  try { return result(await action(store, resolveProject(workingDirectory || process.cwd()))); } finally { store.close(); }
 }
 function tool(name: string, config: any, callback: any): void {
   server.registerTool(name, {
@@ -31,6 +37,11 @@ tool("project_configure", {
   title: "Configure project constitution", description: "Set the small L0 project constitution shared by every persistent role.",
   inputSchema: { cwd, constitution: z.string().max(12000) }, annotations: { readOnlyHint: false, idempotentHint: true }
 }, ({ cwd, constitution }: any) => run(cwd, (store, project) => store.configureProject(project, constitution)));
+
+tool("project_initialize", {
+  title: "Initialize standard role orchestration", description: "Idempotently create the User Liaison, Coordinator, Architect, and Verifier topology. Hook-based initialization also binds the current task to the User Liaison.",
+  inputSchema: { cwd, constitution: z.string().max(12000).optional() }, annotations: { readOnlyHint: false, idempotentHint: true }
+}, ({ cwd, constitution }: any) => run(cwd, (store, project) => initializeStandardTopology(store, project, constitution)));
 
 tool("role_define", {
   title: "Define persistent role", description: "Create or update a durable role charter, semantic ownership, escalation rules, and enforcement policy.",
@@ -55,6 +66,14 @@ tool("role_bind", {
   title: "Bind initial role generation", description: "Bind an unowned thread to a role that has no active generation. Thread-role identity is immutable.",
   inputSchema: { cwd, role_key: z.string(), thread_id: z.string().min(1) }, annotations: { readOnlyHint: false, idempotentHint: true }
 }, ({ cwd, role_key, thread_id }: any) => run(cwd, (store, project) => store.bindInitial(project, role_key, thread_id)));
+
+tool("role_start", {
+  title: "Start initial role task", description: "Create and validate the first Codex task generation for a standard role through App Server. Use this to start the Coordinator after one-prompt initialization.",
+  inputSchema: { cwd, role_key: z.string(), model: z.string().optional() }, annotations: { readOnlyHint: false, idempotentHint: false }
+}, ({ cwd, role_key, model }: any) => runAsync(cwd, async (store, project) => {
+  if (store.activeGeneration(project, role_key)) throw new Error("ROLE_ALREADY_HAS_ACTIVE_GENERATION");
+  return rotateRoleGeneration(store, project, role_key, "initial generation", { ...(model ? { model } : {}) });
+}));
 
 tool("role_context_get", {
   title: "Get layered role context", description: "Read the L0 constitution, L1 charter/state, active L2 tasks, generation, epoch, and pending mailbox count.",
@@ -107,6 +126,14 @@ tool("message_ack", {
   title: "Acknowledge role message", description: "Acknowledge one typed message as its addressed role.",
   inputSchema: { cwd, role_key: z.string(), message_id: z.string() }, annotations: { readOnlyHint: false, idempotentHint: true }
 }, ({ cwd, role_key, message_id }: any) => run(cwd, (store, project) => store.acknowledgeMessage(project, role_key, message_id)));
+
+tool("liaison_request", {
+  title: "Send user request through Coordinator", description: "Send a user request from the active Liaison generation, wake the active Coordinator task, wait for its response, and persist the response back to the Liaison mailbox.",
+  inputSchema: {
+    cwd, liaison_generation: z.number().int().positive(), request: z.string().min(1).max(20000),
+    task_id: z.string().optional(), scope: z.string().max(2000).optional(), message_id: z.string().optional()
+  }, annotations: { readOnlyHint: false, idempotentHint: false }
+}, ({ cwd, ...input }: any) => runAsync(cwd, (store, project) => dispatchLiaisonRequest(store, project, input)));
 
 tool("architecture_advance", {
   title: "Advance architecture epoch", description: "Invalidate work packets from the old architecture after an accepted material architecture change.",

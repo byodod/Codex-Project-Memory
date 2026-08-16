@@ -4,6 +4,7 @@ Codex Role Runtime is a hybrid plugin and local control plane. Every entry point
 
 ```text
 Codex CLI / Desktop
+  ├─ User ↔ Liaison ─> Coordinator dispatch
   ├─ lifecycle Hooks ─┐
   ├─ MCP tools ───────┼─> RoleStore ─> SQLite WAL
   └─ codex-role CLI ──┘      │
@@ -11,6 +12,10 @@ Codex CLI / Desktop
 ```
 
 The durable control plane owns identity, state, policy, routing, tasks, messages, epochs, envelopes, leases, and rotation transactions. Codex owns model execution, top-level threads, native goals, subagents, authentication, and user interaction.
+
+## User interaction boundary
+
+`role://liaison` is the only role that converses with the user. An exact initialization prompt creates the standard topology, binds the current task as the Liaison, and lets the Liaison start the Coordinator with `role_start`. `liaison_request` persists the user request, wakes the active Coordinator generation through App Server, waits for its response, and persists that response back to the Liaison mailbox. The Coordinator routes internal work; internal roles never require direct user contact.
 
 ## Rotation transaction
 

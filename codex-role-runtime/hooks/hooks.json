@@ -1,5 +1,5 @@
 {
-  "description": "Persistent role identity, stale-generation rejection, context anchoring, role policy, and compaction health.",
+  "description": "One-prompt Liaison initialization, persistent role identity, stale-generation rejection, context anchoring, role policy, and compaction health.",
   "hooks": {
     "SessionStart": [{
       "matcher": "startup|resume|clear|compact",
@@ -17,7 +17,7 @@
         "type": "command",
         "command": "node --no-warnings \"${PLUGIN_ROOT}/dist/hook.mjs\"",
         "commandWindows": "node --no-warnings \"%PLUGIN_ROOT%\\dist\\hook.mjs\"",
-        "statusMessage": "Checking role generation",
+        "statusMessage": "Initializing or checking role orchestration",
         "additionalContextLimit": 6000,
         "timeout": 10
       }]

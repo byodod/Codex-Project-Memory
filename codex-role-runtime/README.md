@@ -4,6 +4,7 @@ Codex Role Runtime is a local Codex plugin for **persistent roles over replaceab
 
 The implementation is Codex-native:
 
+- A User Liaison is the single conversational entry point; the user never needs to operate internal roles directly.
 - Hooks restore a compact role anchor, reject retired generations, enforce role tool policy, and track compaction health.
 - MCP exposes the durable Role / Generation / Task / Message / Ownership / Rotation control plane.
 - SQLite provides atomic cutover, idempotency, crash recovery, and hard invariants.
@@ -16,7 +17,10 @@ No OpenAI API key is required. Codex App Server uses the user's existing Codex a
 
 ```text
 Persistent Project
-  └─ Persistent Role (role://architect)
+  ├─ User ↔ User Liaison (role://liaison)
+  │            ↕ typed request / result
+  └─ Coordinator (role://coordinator)
+       └─ Persistent Internal Role (for example role://architect)
        ├─ Structured Role State
        ├─ Typed Mailbox
        ├─ Task / Ownership / Architecture Epoch
@@ -47,28 +51,46 @@ The installer builds the bundle, copies it to `~/plugins/codex-role-runtime`, ad
 
 Restart Codex, open a new task, and review/trust the plugin hooks with `/hooks`.
 
-## First project
+## First project: one prompt
 
-Create the standard governance topology:
+Restart Codex, open a new task in the project, and send:
 
-```powershell
-node "$HOME\plugins\codex-role-runtime\dist\cli.mjs" init --cwd C:\path\to\project
+```text
+初始化角色编排
 ```
 
-This creates three intentionally narrow, read-only long-lived roles:
+That single prompt:
 
+1. Creates the standard four-role topology idempotently.
+2. Permanently binds the current task to `role://liaison` as the user's entry point.
+3. Starts and validates the first `role://coordinator` task through Codex App Server.
+4. Keeps later user requests flowing through `liaison_request`, which wakes the Coordinator and returns its result to the Liaison.
+
+The four intentionally narrow, read-only long-lived roles are:
+
+- `role://liaison` — user conversation, intent clarification, user decisions, and user-facing status/results.
 - `role://coordinator` — project goal, task graph, dependencies, routing, milestones, blockers.
 - `role://architect` — architecture, semantic ownership, dependency direction, cross-module contracts.
 - `role://verifier` — fresh independent acceptance, architecture consistency, diff-versus-intent, test evidence.
 
 Add Module Owners only for real bounded contexts. Use short-lived `workspace_write` workers for implementation.
 
-## Bind, start, and rotate
+The Liaison may exchange typed messages only with the Coordinator. Internal roles report to the Coordinator, and the Coordinator returns questions, progress, blockers, and verified results through the Liaison. This keeps one stable user-facing conversation while internal role generations rotate independently.
 
-To bind the current ordinary Codex task as generation 1, send this exact prompt after the role exists:
+## Advanced and recovery operations
+
+The CLI and manual binding syntax remain available for recovery, automation, and custom topologies; they are not required for the default flow.
+
+Prepare the standard topology without binding the current task:
+
+```powershell
+node "$HOME\plugins\codex-role-runtime\dist\cli.mjs" init --cwd C:\path\to\project
+```
+
+Bind an ordinary Codex task explicitly:
 
 ```text
-role://bind coordinator
+role://bind architect
 ```
 
 To let the runtime create a fresh top-level thread through Codex App Server:
@@ -104,10 +126,10 @@ The new thread first returns a structured health packet. The runtime compares it
 
 | Area | Tools |
 |---|---|
-| Project / status | `status`, `project_configure`, `architecture_advance` |
-| Roles / state | `role_define`, `role_list`, `role_bind`, `role_context_get`, `role_state_put`, `role_state_list` |
+| Project / status | `status`, `project_initialize`, `project_configure`, `architecture_advance` |
+| Roles / state | `role_define`, `role_list`, `role_bind`, `role_start`, `role_context_get`, `role_state_put`, `role_state_list` |
 | Work graph | `task_upsert`, `task_graph`, `change_envelope_create`, `change_envelope_check` |
-| Typed communication | `message_send`, `message_inbox`, `message_ack` |
+| Typed communication | `liaison_request`, `message_send`, `message_inbox`, `message_ack` |
 | Rotation adapters | `rotation_prepare`, `rotation_candidate_register`, `rotation_cutover` |
 
 Typed messages support `ASSIGN`, `QUESTION`, `ANSWER`, `PROPOSAL`, `DECISION_REQUEST`, `DECISION`, `HANDOFF`, `VERIFY_REQUEST`, `RESULT`, and `BLOCKED`.

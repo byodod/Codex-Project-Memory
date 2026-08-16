@@ -4,7 +4,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { RoleStore, resolveProject } from "../dist/library.mjs";
+import { initializeStandardTopology, RoleStore, resolveProject } from "../dist/library.mjs";
 
 function fixture() {
   const cwd = mkdtempSync(join(tmpdir(), "codex-role-project-"));
@@ -15,6 +15,25 @@ function fixture() {
   store.defineRole(project, { role_key: "implementer", kind: "worker", mission: "Implement bounded changes.", owned_domains: ["implementation"], policy: { mode: "workspace_write", allowedWriteGlobs: ["^src/"] } });
   return { cwd, data, store, project };
 }
+
+test("standard topology makes liaison the coordinator-only user gateway", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "codex-role-topology-project-"));
+  const data = mkdtempSync(join(tmpdir(), "codex-role-topology-data-"));
+  const store = new RoleStore(data); const project = resolveProject(cwd);
+  try {
+    const first = initializeStandardTopology(store, project);
+    const second = initializeStandardTopology(store, project);
+    assert.equal(first.entry_role, "liaison");
+    assert.equal(second.roles.length, 4);
+    assert.equal(store.listRoles(project).length, 4);
+    store.bindInitial(project, "liaison", "thr-liaison");
+    store.bindInitial(project, "coordinator", "thr-coordinator");
+    const request = store.sendMessage(project, { type: "ASSIGN", from_role: "liaison", to_role: "coordinator", from_generation: 1, architecture_epoch: 1, payload: { intent: "Build the requested feature" } });
+    assert.equal(request.to_role, "coordinator");
+    assert.throws(() => store.sendMessage(project, { type: "QUESTION", from_role: "liaison", to_role: "architect", from_generation: 1, architecture_epoch: 1, payload: { question: "Talk to the user directly?" } }), /LIAISON_ROUTE_REQUIRES_COORDINATOR/);
+    assert.match(store.roleAnchor(project, "liaison"), /sole conversational entry point/);
+  } finally { store.close(); }
+});
 
 test("database enforces one active generation and immutable thread identity", () => {
   const { store, project } = fixture();

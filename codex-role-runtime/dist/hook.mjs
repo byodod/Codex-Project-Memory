@@ -491,6 +491,9 @@ var RoleStore = class {
     const from = this.getRole(project, input2.from_role);
     const to = this.getRole(project, input2.to_role);
     if (!from || !to) throw new Error("UNKNOWN_MESSAGE_ROLE");
+    if ((from.role_key === "liaison" || to.role_key === "liaison") && from.role_key !== "coordinator" && to.role_key !== "coordinator") {
+      throw new Error("LIAISON_ROUTE_REQUIRES_COORDINATOR");
+    }
     this.assertCurrent(from, input2.from_generation);
     if (input2.architecture_epoch !== this.projectEpoch(project)) throw new Error("STALE_ARCHITECTURE_EPOCH");
     const id = input2.message_id || newId("msg");
@@ -661,6 +664,7 @@ var RoleStore = class {
     const facts = context2.facts;
     const invariants = facts.filter((fact) => fact.kind === "invariant").slice(0, 8);
     const tasks = context2.tasks;
+    const interactionContract = role.role_key === "liaison" ? "Interaction contract: you are the user's sole conversational entry point. Clarify intent, send structured requests and decisions to role://coordinator, and translate its questions, progress, blockers, and verified results for the user. Do not perform internal coordination or implementation yourself." : role.role_key === "coordinator" ? "Interaction contract: receive user intent from role://liaison and return questions, progress, blockers, and results through role://liaison; do not require the user to contact internal roles." : "Interaction contract: communicate user-facing questions and results through role://coordinator, which routes them through role://liaison.";
     return [
       "[Codex Role Runtime]",
       `Role: ${role.name} (role://${role.role_key})`,
@@ -672,6 +676,7 @@ var RoleStore = class {
       `Active tasks: ${tasks.map((task) => `${task.id}:${task.title}`).join(" | ") || "none"}`,
       `Critical invariants: ${invariants.map((fact) => fact.content).join(" | ") || "none recorded"}`,
       `Pending typed messages: ${context2.pending_messages}`,
+      interactionContract,
       "Address other persistent roles by role:// key. Never treat this thread id as the role identity."
     ].join("\n");
   }
@@ -687,6 +692,69 @@ var RoleStore = class {
     return { project: { ...project, architecture_epoch: Number(projectRow.architecture_epoch), constitution: projectRow.constitution }, roles: this.listRoles(project), counts, open_rotations: rotations, database_path: this.databasePath };
   }
 };
+
+// src/topology.ts
+var STANDARD_CONSTITUTION = "Preserve modular boundaries, route user communication through the Liaison, route project work through the Coordinator, route cross-domain decisions through semantic owners, and require independent verification.";
+var STANDARD_ROLES = [
+  {
+    role_key: "liaison",
+    name: "User Liaison",
+    kind: "governance",
+    mission: "Serve as the user's conversational gateway: clarify intent, preserve user decisions, translate requests into structured messages for role://coordinator, and relay questions, progress, blockers, and verified results in user-facing language.",
+    owned_domains: ["user communication", "intent clarification", "user decisions", "status synthesis"],
+    excluded_domains: ["project scheduling", "architecture", "implementation", "verification"],
+    escalation_rules: ["Route all internal work through role://coordinator", "Ask the user only when a decision materially changes scope, risk, cost, or outcome"],
+    policy: { mode: "read_only", canDelegateTo: ["coordinator"] }
+  },
+  {
+    role_key: "coordinator",
+    name: "Coordinator",
+    kind: "governance",
+    mission: "Maintain project goal, task graph, dependencies, role directory, blockers, and routing without absorbing all module knowledge.",
+    owned_domains: ["project goal", "task graph", "routing", "milestones"],
+    excluded_domains: ["user-facing conversation", "implementation", "module internals"],
+    escalation_rules: ["Exchange user requests, questions, and results only through role://liaison", "Architecture changes go to role://architect"],
+    policy: { mode: "read_only", canDelegateTo: ["architect", "verifier"] }
+  },
+  {
+    role_key: "architect",
+    name: "Architect",
+    kind: "governance",
+    mission: "Protect system structure, semantic ownership, dependency direction, cross-module contracts, and migrations.",
+    owned_domains: ["architecture", "module boundaries", "dependency direction", "cross-module contracts"],
+    excluded_domains: ["user-facing conversation", "routine implementation"],
+    escalation_rules: ["Product-direction decisions return to role://coordinator and role://liaison"],
+    policy: { mode: "read_only", canDelegateTo: ["verifier"] }
+  },
+  {
+    role_key: "verifier",
+    name: "Verifier",
+    kind: "governance",
+    mission: "Independently verify requirements, architecture consistency, actual diff scope, and objective test evidence.",
+    owned_domains: ["verification", "acceptance", "diff review"],
+    excluded_domains: ["user-facing conversation", "implementation"],
+    escalation_rules: ["Reject unverifiable or out-of-scope changes and report through role://coordinator"],
+    policy: { mode: "read_only", freshVerification: true }
+  }
+];
+function isRoleInitializationPrompt(prompt) {
+  if (!prompt) return false;
+  const normalized = prompt.trim().replace(/[。.!！]+$/u, "").trim().toLowerCase();
+  return normalized === "\u521D\u59CB\u5316\u89D2\u8272\u7F16\u6392" || normalized === "\u542F\u52A8\u89D2\u8272\u7F16\u6392" || normalized === "initialize role orchestration";
+}
+function initializeStandardTopology(store2, project, constitution) {
+  const existing = store2.ensureProject(project);
+  if (constitution !== void 0 || !String(existing.constitution || "").trim()) {
+    store2.configureProject(project, constitution ?? STANDARD_CONSTITUTION);
+  }
+  const roles = STANDARD_ROLES.map((role) => store2.defineRole(project, role));
+  return {
+    project: store2.configureProject(project),
+    entry_role: "liaison",
+    coordinator_role: "coordinator",
+    roles
+  };
+}
 
 // src/hook.ts
 function readInput() {
@@ -712,6 +780,19 @@ try {
   const project = resolveProject(input.cwd);
   let binding = store.getGenerationByThread(project, input.session_id);
   if (!binding && input.hook_event_name === "UserPromptSubmit") {
+    if (isRoleInitializationPrompt(input.prompt)) {
+      initializeStandardTopology(store, project);
+      const active = store.activeGeneration(project, "liaison");
+      if (active && active.thread_id !== input.session_id) {
+        process.stdout.write(JSON.stringify(deny(input.hook_event_name, "USER_LIAISON_ALREADY_ACTIVE: continue the existing User Liaison task, or rotate role://liaison before binding this task.")));
+        process.exit(0);
+      }
+      const generation2 = store.bindInitial(project, "liaison", input.session_id);
+      process.stdout.write(JSON.stringify(context(input.hook_event_name, `Role orchestration initialized. This task is the user's communication entry point.
+${store.roleAnchor(project, "liaison")}
+Send structured user intent to role://coordinator; relay its questions, progress, blockers, and verified results back to the user.`)));
+      process.exit(0);
+    }
     const claim = input.prompt?.match(/^\s*role:\/\/bind\s+([a-z0-9-]+)\s*$/i);
     if (claim?.[1]) {
       const generation2 = store.bindInitial(project, claim[1], input.session_id);

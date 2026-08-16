@@ -12,6 +12,36 @@ function invoke(cwd, data, input) {
   assert.equal(run.status, 0, run.stderr); return run.stdout.trim() ? JSON.parse(run.stdout) : {};
 }
 
+test("one prompt initializes the standard topology and binds this task as the user liaison", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "codex-role-init-project-")); const data = mkdtempSync(join(tmpdir(), "codex-role-init-data-"));
+
+  const initialized = invoke(cwd, data, { session_id: "thr-user", turn_id: "t0", cwd, hook_event_name: "UserPromptSubmit", prompt: "初始化角色编排" });
+  assert.match(initialized.hookSpecificOutput.additionalContext, /role:\/\/liaison/);
+  assert.match(initialized.hookSpecificOutput.additionalContext, /communication entry point/);
+
+  const repeated = invoke(cwd, data, { session_id: "thr-user", turn_id: "t1", cwd, hook_event_name: "UserPromptSubmit", prompt: "初始化角色编排。" });
+  assert.match(repeated.hookSpecificOutput.additionalContext, /role:\/\/liaison/);
+
+  const store = new RoleStore(data); const project = resolveProject(cwd);
+  assert.deepEqual(store.listRoles(project).map((role) => role.role_key).sort(), ["architect", "coordinator", "liaison", "verifier"]);
+  assert.equal(store.activeGeneration(project, "liaison").thread_id, "thr-user");
+  assert.equal(store.db.prepare("SELECT count(*) n FROM role_generations").get().n, 1);
+  store.close();
+
+  const duplicate = invoke(cwd, data, { session_id: "thr-other", turn_id: "t0", cwd, hook_event_name: "UserPromptSubmit", prompt: "initialize role orchestration" });
+  assert.equal(duplicate.decision, "block");
+  assert.match(duplicate.reason, /USER_LIAISON_ALREADY_ACTIVE/);
+});
+
+test("ordinary prompts do not initialize or bind a role", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "codex-role-ordinary-project-")); const data = mkdtempSync(join(tmpdir(), "codex-role-ordinary-data-"));
+  assert.deepEqual(invoke(cwd, data, { session_id: "thr-user", turn_id: "t0", cwd, hook_event_name: "UserPromptSubmit", prompt: "请分析一下角色编排方案" }), {});
+  const store = new RoleStore(data); const project = resolveProject(cwd);
+  assert.equal(store.listRoles(project).length, 0);
+  assert.equal(store.getGenerationByThread(project, "thr-user"), null);
+  store.close();
+});
+
 test("hook claims role, injects anchor, enforces read-only policy, and counts compact idempotently", () => {
   const cwd = mkdtempSync(join(tmpdir(), "codex-role-hook-project-")); const data = mkdtempSync(join(tmpdir(), "codex-role-hook-data-"));
   const store = new RoleStore(data); const project = resolveProject(cwd);
