@@ -75,6 +75,8 @@ Role Runtime adds role definition/status, `role_start`, role facts, task graph, 
 
 The installed plugin includes a destructive, project-scoped reset command. It removes the resolved project's Project Memory tasks, memories, events, verifications, checkpoints and generated exports, plus all Role Runtime roles, generations, task graph, messages, rotations, events and change envelopes. Other projects are not touched.
 
+After installing or updating the plugin and starting a new Codex task, type `/` in the composer and choose **Reset Project Runtime** (`reset-project`). Enabled skills are shown in Codex's slash-command list, so this is the normal user-facing reset entry. The skill is explicit-only: Codex will not select it implicitly from an ordinary cleanup request. It resolves the current project root and delegates the destructive operation to the guarded CLI below.
+
 The command requires the same exact project root twice, so a mistyped `cwd` cannot be silently confirmed:
 
 ```powershell

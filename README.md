@@ -26,6 +26,8 @@ npm test
 
 需要让某个项目彻底从零开始时，可执行以下破坏性命令。它只清除两次明确指定的同一项目根目录所对应的全部项目记忆、导出文件、角色、Generation、任务图、消息、轮换和事件；其他项目不受影响：
 
+安装更新并新建 Codex 任务后，直接在输入框键入 `/`，选择 **Reset Project Runtime**（技能名 `reset-project`）即可。Codex 会把已启用技能显示在斜杠命令列表中；该技能禁止隐式触发，只会在用户明确选择并提交清除请求时运行。它会自动解析当前项目根目录，并调用下方带双重根目录校验的 CLI 执行实际清除。
+
 ```powershell
 $projectRoot = "E:\Github\4.6\Game-10"
 node --no-warnings "$env:USERPROFILE\plugins\codex-project-memory\dist\cli.mjs" reset-project --cwd $projectRoot --confirm-root $projectRoot

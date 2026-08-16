@@ -9,6 +9,8 @@ const required = [
   "hooks/hooks.json",
   "skills/project-memory/SKILL.md",
   "skills/role-runtime/SKILL.md",
+  "skills/reset-project/SKILL.md",
+  "skills/reset-project/agents/openai.yaml",
   "dist/mcp-server.mjs",
   "dist/hook.mjs",
   "dist/integrated-hook.mjs",
@@ -23,6 +25,12 @@ const manifest = JSON.parse(await readFile(resolve(root, ".codex-plugin/plugin.j
 const mcp = JSON.parse(await readFile(resolve(root, ".mcp.json"), "utf8"));
 const hooks = JSON.parse(await readFile(resolve(root, "hooks/hooks.json"), "utf8"));
 if (manifest.name !== "codex-project-memory" || manifest.mcpServers !== "./.mcp.json") throw new Error("Manifest identity or MCP path is invalid.");
+const resetSkill = await readFile(resolve(root, "skills/reset-project/SKILL.md"), "utf8");
+const resetSkillUi = await readFile(resolve(root, "skills/reset-project/agents/openai.yaml"), "utf8");
+if (!resetSkill.includes("name: reset-project") || resetSkill.includes("[TODO:")) throw new Error("Reset Project slash-menu skill is invalid.");
+if (!resetSkillUi.includes('display_name: "Reset Project Runtime"') || !resetSkillUi.includes("allow_implicit_invocation: false")) {
+  throw new Error("Reset Project skill must be visible in the UI and explicit-only.");
+}
 if (!mcp.mcpServers?.project_memory?.args?.some((value) => value.includes("process.env.PLUGIN_ROOT"))) throw new Error("MCP entry must resolve from the PLUGIN_ROOT environment.");
 if (!mcp.mcpServers?.role_runtime?.args?.some((value) => value.includes("role-mcp-server.mjs"))) throw new Error("Integrated role_runtime MCP entry is missing.");
 for (const event of ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact", "PostCompact", "Stop", "SessionEnd"]) {
