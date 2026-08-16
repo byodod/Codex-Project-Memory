@@ -1,0 +1,89 @@
+{
+  "description": "Project Memory lifecycle capture, recall, compaction checkpoint, and completion gate.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|compact",
+        "hooks": [{
+          "type": "command",
+          "command": "node --no-warnings \"${PLUGIN_ROOT}/dist/hook.mjs\"",
+          "commandWindows": "node --no-warnings \"%PLUGIN_ROOT%\\dist\\hook.mjs\"",
+          "statusMessage": "Restoring project memory",
+          "additionalContextLimit": 6000,
+          "timeout": 10
+        }]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [{
+          "type": "command",
+          "command": "node --no-warnings \"${PLUGIN_ROOT}/dist/hook.mjs\"",
+          "commandWindows": "node --no-warnings \"%PLUGIN_ROOT%\\dist\\hook.mjs\"",
+          "statusMessage": "Recalling project context",
+          "additionalContextLimit": 5000,
+          "timeout": 10
+        }]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|apply_patch|Edit|Write",
+        "hooks": [{
+          "type": "command",
+          "command": "node --no-warnings \"${PLUGIN_ROOT}/dist/hook.mjs\"",
+          "commandWindows": "node --no-warnings \"%PLUGIN_ROOT%\\dist\\hook.mjs\"",
+          "statusMessage": "Checking relevant project memory",
+          "additionalContextLimit": 4000,
+          "timeout": 10
+        }]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|apply_patch|Edit|Write",
+        "hooks": [{
+          "type": "command",
+          "command": "node --no-warnings \"${PLUGIN_ROOT}/dist/hook.mjs\"",
+          "commandWindows": "node --no-warnings \"%PLUGIN_ROOT%\\dist\\hook.mjs\"",
+          "statusMessage": "Recording tool evidence",
+          "timeout": 10
+        }]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [{
+          "type": "command",
+          "command": "node --no-warnings \"${PLUGIN_ROOT}/dist/hook.mjs\"",
+          "commandWindows": "node --no-warnings \"%PLUGIN_ROOT%\\dist\\hook.mjs\"",
+          "statusMessage": "Checkpointing project memory",
+          "timeout": 10
+        }]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [{
+          "type": "command",
+          "command": "node --no-warnings \"${PLUGIN_ROOT}/dist/hook.mjs\"",
+          "commandWindows": "node --no-warnings \"%PLUGIN_ROOT%\\dist\\hook.mjs\"",
+          "statusMessage": "Checking task completion",
+          "timeout": 10
+        }]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [{
+          "type": "command",
+          "command": "node --no-warnings \"${PLUGIN_ROOT}/dist/hook.mjs\"",
+          "commandWindows": "node --no-warnings \"%PLUGIN_ROOT%\\dist\\hook.mjs\"",
+          "statusMessage": "Exporting project memory",
+          "timeout": 3
+        }]
+      }
+    ]
+  }
+}

@@ -1,0 +1,6 @@
+node_modules/
+codex-project-memory/node_modules/
+codex-project-memory/.data/
+codex-project-memory/dist/*.map
+*.log
+.DS_Store

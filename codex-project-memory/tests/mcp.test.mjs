@@ -1,0 +1,57 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+
+test("bundled MCP server lists and calls project-memory tools over stdio", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "codex-memory-mcp-project-"));
+  const data = mkdtempSync(join(tmpdir(), "codex-memory-mcp-data-"));
+  const client = new Client({ name: "project-memory-test", version: "1.0.0" });
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: ["--no-warnings", resolve("dist/mcp-server.mjs")],
+    env: { ...process.env, CODEX_PROJECT_MEMORY_HOME: data }
+  });
+  try {
+    await client.connect(transport);
+    const listed = await client.listTools();
+    const names = new Set(listed.tools.map((item) => item.name));
+    for (const required of ["task_get", "task_upsert", "memory_search", "memory_store", "verification_record", "task_checkpoint"]) {
+      assert.ok(names.has(required), `${required} missing`);
+    }
+    const created = await client.callTool({
+      name: "task_upsert",
+      arguments: { cwd, title: "MCP task", goal: "Prove stdio works", acceptance_criteria: ["MCP responds"], next_steps: ["call status"] }
+    });
+    assert.equal(created.isError, undefined);
+    const status = await client.callTool({ name: "status", arguments: { cwd } });
+    assert.equal(status.isError, undefined);
+    assert.match(status.content[0].text, /MCP task/);
+  } finally {
+    await client.close();
+  }
+});
+
+test("the packaged MCP launcher resolves PLUGIN_ROOT without shell interpolation", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "codex-memory-package-project-"));
+  const data = mkdtempSync(join(tmpdir(), "codex-memory-package-data-"));
+  const pluginRoot = resolve(".");
+  const config = JSON.parse(readFileSync(resolve(".mcp.json"), "utf8")).mcpServers.project_memory;
+  const client = new Client({ name: "project-memory-package-test", version: "1.0.0" });
+  const transport = new StdioClientTransport({
+    command: config.command,
+    args: config.args,
+    env: { ...process.env, PLUGIN_ROOT: pluginRoot, PLUGIN_DATA: data }
+  });
+  try {
+    await client.connect(transport);
+    const status = await client.callTool({ name: "status", arguments: { cwd } });
+    assert.equal(status.isError, undefined);
+    assert.match(status.content[0].text, /project-memory.sqlite3/);
+  } finally {
+    await client.close();
+  }
+});

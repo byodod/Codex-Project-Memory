@@ -1,0 +1,36 @@
+{
+  "name": "codex-project-memory",
+  "version": "1.0.0+codex.20260816171221",
+  "description": "Durable, provenance-aware project memory for long-running Codex development tasks.",
+  "author": {
+    "name": "Local developer"
+  },
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "memory",
+    "long-running tasks",
+    "sqlite",
+    "mcp",
+    "hooks"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Codex Project Memory",
+    "shortDescription": "Durable memory for long Codex projects",
+    "longDescription": "Keeps compact task state, decisions, failures, verification evidence, and searchable project history across compaction and resumed sessions.",
+    "developerName": "Local developer",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Show the active project-memory task and its open loops.",
+      "Search project memory for the last failed approach.",
+      "Checkpoint this task before I switch projects."
+    ],
+    "brandColor": "#0F766E"
+  }
+}
