@@ -28,6 +28,10 @@ if (!mcp.mcpServers?.role_runtime?.args?.some((value) => value.includes("role-mc
 for (const event of ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact", "PostCompact", "Stop", "SessionEnd"]) {
   if (!hooks.hooks[event]?.length) throw new Error(`Missing ${event} hook.`);
 }
+const sessionEndHandlers = hooks.hooks.SessionEnd.flatMap((registration) => registration.hooks || []);
+if (sessionEndHandlers.some((hook) => hook.timeout === undefined || hook.timeout > 3)) {
+  throw new Error("SessionEnd Hook timeout must be explicitly set to at most 3 seconds.");
+}
 const commands = Object.values(hooks.hooks).flatMap((registrations) => registrations.flatMap((registration) => registration.hooks || []).map((hook) => hook.command));
 if (!commands.every((command) => command?.includes("integrated-hook.mjs"))) throw new Error("Every lifecycle event must use the integrated memory and role Hook launcher.");
 if (commands.some((command) => !command?.includes("process.env.PLUGIN_ROOT"))) throw new Error("Hook launchers must resolve from PLUGIN_ROOT without shell interpolation.");

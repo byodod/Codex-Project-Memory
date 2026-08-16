@@ -78,7 +78,7 @@
         "command": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','integrated-hook.mjs')).href)\"",
         "commandWindows": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','integrated-hook.mjs')).href)\"",
         "statusMessage": "Exporting project and role state",
-        "timeout": 8
+        "timeout": 3
       }]
     }]
   }
