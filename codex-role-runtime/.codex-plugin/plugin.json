@@ -1,0 +1,37 @@
+{
+  "name": "codex-role-runtime",
+  "version": "1.0.0+codex.20260816181130",
+  "description": "Persistent roles, replaceable Codex thread generations, typed routing, and role policy enforcement.",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Role Runtime",
+    "shortDescription": "Persistent roles over replaceable Codex threads",
+    "longDescription": "Keeps role identity, ownership, task state, typed messages, and policy outside model context while Codex threads rotate safely.",
+    "developerName": "Local developer",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Initialize the standard Coordinator, Architect, and Verifier roles for this project.",
+      "Show active role generations, health, messages, and blockers.",
+      "Prepare a safe session rotation for the Architect role."
+    ],
+    "brandColor": "#4338CA"
+  },
+  "mcpServers": "./.mcp.json",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "roles",
+    "orchestration",
+    "threads",
+    "sqlite",
+    "mcp",
+    "hooks"
+  ]
+}
