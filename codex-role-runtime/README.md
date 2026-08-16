@@ -54,6 +54,8 @@ After plugin installation, open a project task and send:
 
 The Hook creates Liaison, Coordinator, Architect, and Verifier definitions and binds the current task as Liaison. During that same turn the Liaison model uses desktop `list_projects`, `list_threads`/`read_thread`, and `create_thread` as needed, then calls `role_attach` for the Coordinator.
 
+For a project task, `projectId` is passed only as `target.projectId`; it is not also passed at the top level of `create_thread`. Persistent roles use the saved project's local checkout. A queued `clientThreadId` is never attached or treated as a failure: the model waits for the same task's real `threadId` instead of creating a duplicate or falling back to a fork.
+
 If a stored task is missing, archived, deleted, or unavailable, the model creates a new task and calls `role_attach`. The old generation becomes retired; it is not recovered or resurrected.
 
 ## Request flow

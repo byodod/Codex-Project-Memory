@@ -7,6 +7,50 @@ description: Keep persistent project roles independent from replaceable Codex de
 
 Use `role_runtime` as the durable role control plane and Codex desktop task tools as the task transport. The MCP server stores identities, generations, task graphs, mailboxes, policies, and checkpoints. It never queries, creates, resumes, archives, or runs Codex tasks and never invokes the Codex CLI or App Server.
 
+## Desktop task transport contract
+
+Treat these desktop calls as exact argument whitelists:
+
+```js
+list_projects({})
+list_threads({ limit: 50 })
+
+create_thread({
+  target: {
+    type: "project",
+    projectId,
+    environment: { type: "local" }
+  },
+  prompt,
+  title
+})
+
+read_thread({
+  threadId,
+  hostId,
+  includeOutputs: true,
+  turnLimit: 5,
+  maxOutputCharsPerItem: 12000
+})
+
+send_message_to_thread({
+  threadId,
+  hostId,
+  prompt
+})
+
+wait_threads({
+  targets: [{ threadId, hostId }],
+  timeoutMs: 120000
+})
+```
+
+Call `list_projects({})` first and select the `projectId` whose normalized path equals the current project root. `projectId` belongs only at `create_thread.target.projectId`; never add a second top-level `projectId` beside `target`. Persistent roles use `local` so they share the live project checkout. Use a worktree only when the user explicitly requests isolation; then replace `environment` with `{ type: "worktree", startingState: { type: "working-tree" } }` without changing the location of `projectId`.
+
+Search both `pinnedThreads` and `threads` from `list_threads`, match an existing binding by exact `threadId`, and carry its returned `hostId` into read/send/wait calls. `read_thread` accepts only `threadId`, optional `hostId`, `cursor`, `includeOutputs`, `maxOutputCharsPerItem`, and `turnLimit`. `send_message_to_thread` accepts only `threadId`, `prompt`, optional `hostId`, `model`, and `thinking`; its message field is named `prompt`, never `message`, `content`, `taskId`, `projectId`, or `target`.
+
+Only set `model` and `thinking` on create/send when user or project instructions require them, and use the canonical model id exposed by the desktop tool, such as `gpt-5.6-luna` with `thinking: "max"`. If creation returns `threadId`, attach it. If it returns only `clientThreadId`, setup is pending: do not pass that value to read/send/wait/`role_attach`, do not call `create_thread` again, and do not fall back to `fork_thread`. Resolve the one pending task through `list_threads` until its real `threadId` and `hostId` are available, then attach it. After sending, wait with `wait_threads({ targets: [{ threadId, hostId }], timeoutMs })`; reuse any returned cursor as that target's `afterCursor` on a later wait.
+
 ## Invariants
 
 - Address roles as `role://<role-key>`, never by task id.
@@ -23,7 +67,7 @@ In that same model turn:
 
 1. Call `role_runtime.status`.
 2. Use Codex desktop `list_projects` and `list_threads`/`read_thread` to check the stored Coordinator task id.
-3. If no Coordinator is attached, or the attached task is missing, archived, deleted, or unavailable, call desktop `create_thread` for a local task in the current project. Use a prompt containing the Coordinator role anchor and tell it to await routed work.
+3. If no Coordinator is attached, or the attached task is missing, archived, deleted, or unavailable, create one task using the exact desktop task transport contract above. Use a prompt containing the Coordinator role anchor and tell it to await routed work.
 4. Call `role_runtime.role_attach` with `role_key: "coordinator"` and the returned task id. A different id retires the old generation automatically.
 5. Report that Liaison and Coordinator are ready. Do not expose internal task ids unless debugging requires them.
 
@@ -45,7 +89,7 @@ Do not attempt to restore an unavailable task. Create a replacement and attach i
 The Coordinator owns the internal role graph. For an assignment:
 
 1. Persist it with `message_send`; the result contains the recipient's attached desktop task id or `needs_task`.
-2. If needed, create a local desktop task for that role and call `role_attach`. If the stored task is archived, deleted, missing, or unavailable, create a new one and attach it directly.
+2. If needed, create exactly one desktop task for that role with the transport contract above, wait for its real `threadId`, and call `role_attach`. If the stored task is archived, deleted, missing, or unavailable, create one replacement and attach it directly.
 3. Send a prompt to the desktop task with `send_message_to_thread`; wait/read through desktop tools.
 4. Persist the role's `RESULT`, `BLOCKED`, or `QUESTION` with `message_send`, and acknowledge consumed inbox items with `message_ack`.
 

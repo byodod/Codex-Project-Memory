@@ -74,6 +74,17 @@ test("integrated Hook merges project memory with role initialization and policy"
   const initialized = invokeIntegrated({ session_id: "thr-integrated-user", turn_id: "t0", cwd, hook_event_name: "UserPromptSubmit", prompt: "初始化角色编排" });
   assert.match(initialized.hookSpecificOutput.additionalContext, /communication entry point/);
   assert.match(initialized.hookSpecificOutput.additionalContext, /Codex desktop task tools/);
+  assert.match(initialized.hookSpecificOutput.additionalContext, /list_projects\(\{\}\)/);
+  assert.match(initialized.hookSpecificOutput.additionalContext, /list_threads\(\{ limit \}\)/);
+  assert.match(initialized.hookSpecificOutput.additionalContext, /create_thread\(\{ target/);
+  assert.match(initialized.hookSpecificOutput.additionalContext, /read_thread\(\{ threadId, hostId/);
+  assert.match(initialized.hookSpecificOutput.additionalContext, /send_message_to_thread\(\{ threadId, hostId, prompt \}\)/);
+  assert.match(initialized.hookSpecificOutput.additionalContext, /wait_threads\(\{ targets/);
+  assert.match(initialized.hookSpecificOutput.additionalContext, /projectId belongs only at create_thread\.target\.projectId/);
+  assert.match(initialized.hookSpecificOutput.additionalContext, /never add a top-level projectId/);
+  assert.match(initialized.hookSpecificOutput.additionalContext, /send field is prompt/);
+  assert.match(initialized.hookSpecificOutput.additionalContext, /clientThreadId/);
+  assert.match(initialized.hookSpecificOutput.additionalContext, /fall back to fork_thread/);
   const handedOff = invokeIntegrated({ session_id: "thr-integrated-user-2", turn_id: "t0", cwd, hook_event_name: "UserPromptSubmit", prompt: "启动角色编排" });
   assert.match(handedOff.hookSpecificOutput.additionalContext, /resumed and handed off/);
   const resumed = invokeIntegrated({ session_id: "thr-integrated-user", cwd, hook_event_name: "SessionStart", source: "resume" });
