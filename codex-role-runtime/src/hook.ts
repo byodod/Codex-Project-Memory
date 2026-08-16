@@ -22,6 +22,8 @@ function deny(event: string, reason: string): Record<string, unknown> {
   return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } };
 }
 
+const desktopTaskContract = `Use exact desktop shapes: list_projects({}); list_threads({ limit }); create_thread({ target: { type: "project", projectId, environment: { type: "local" } }, prompt, title }); read_thread({ threadId, hostId, includeOutputs, turnLimit, maxOutputCharsPerItem }); send_message_to_thread({ threadId, hostId, prompt }); wait_threads({ targets: [{ threadId, hostId }], timeoutMs }). Match the current project root. projectId belongs only at create_thread.target.projectId; never add a top-level projectId beside target. The send field is prompt, never message/content/taskId/projectId/target. If create_thread returns only clientThreadId, do not attach/read/send/wait it, create another task, or fall back to fork_thread. Resolve that same task's real threadId and hostId through list_threads, then call role_attach.`;
+
 function isMutatingShell(value: unknown): boolean {
   const command = typeof value === "object" && value ? String((value as Record<string, unknown>).command || "") : "";
   return /(^|[;&|]\s*)(rm|del|erase|rmdir|remove-item|move-item|copy-item|mv|cp|mkdir|md|touch|new-item|set-content|add-content)\b|(^|\s)(git\s+(commit|merge|rebase|cherry-pick|reset|checkout|switch|add)|npm\s+(install|update)|pnpm\s+(install|add)|yarn\s+add)\b|(^|[^>])>{1,2}(?!>)/i.test(command);
@@ -41,7 +43,7 @@ try {
         ? handoffRoleGenerationToThread(store, project, "liaison", input.session_id, "User selected a new Liaison entry task with the exact initialization prompt.")
         : { handed_off: false, generation: store.bindInitial(project, "liaison", input.session_id) };
       const action = active ? "resumed and handed off" : "initialized";
-      process.stdout.write(JSON.stringify(context(input.hook_event_name, `Role orchestration ${action}. This task is now the user's communication entry point.\n${store.roleAnchor(project, "liaison")}\nUse Codex desktop task tools directly to list or read the Coordinator task. If it is missing, archived, deleted, or otherwise unavailable, create a new local task for this project and call role_attach with its task id. Do not use Codex CLI or App Server for task lifecycle operations. Then route structured user intent to role://coordinator and relay its questions, progress, blockers, and verified results back to the user.`)));
+      process.stdout.write(JSON.stringify(context(input.hook_event_name, `Role orchestration ${action}. This task is now the user's communication entry point.\n${store.roleAnchor(project, "liaison")}\nUse Codex desktop task tools directly to list or read the Coordinator task. If it is missing, archived, deleted, or otherwise unavailable, create one replacement and attach its real task id. ${desktopTaskContract} Do not use Codex CLI or App Server for task lifecycle operations. Then route structured user intent to role://coordinator and relay its questions, progress, blockers, and verified results back to the user.`)));
       process.exit(0);
     }
     const claim = input.prompt?.match(/^\s*role:\/\/bind\s+([a-z0-9-]+)\s*$/i);

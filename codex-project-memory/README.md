@@ -36,6 +36,8 @@ Then restart Codex and begin a new task. Plugin hooks are non-managed code: open
 
 To initialize the default role topology, send `初始化角色编排`. The integrated Hook creates the four role definitions and binds the current task as `role://liaison`. In that same turn, the Liaison model uses Codex desktop task interfaces to find or create the Coordinator and records the actual task id with `role_attach`. Repeating the exact prompt from another task hands the Liaison generation off safely. If any bound role task is missing, archived, deleted, or unavailable, the model simply creates a new desktop task and attaches it; the old generation is retired. MCP calls persist role state and typed messages but never start Codex CLI, App Server, or hidden model turns.
 
+Desktop role creation follows the app schema literally: the selected project id appears only at `target.projectId`, never as an extra top-level `projectId`. Persistent roles use the live local checkout. If worktree setup returns only `clientThreadId`, orchestration waits for that task's real `threadId`; it does not create a duplicate, attach the client id, or substitute a fork.
+
 ## Normal Codex workflow
 
 The bundled `project-memory` skill automatically applies to substantial multi-step engineering tasks. Its expected flow is:

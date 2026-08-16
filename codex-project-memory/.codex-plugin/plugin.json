@@ -1,6 +1,6 @@
 {
   "name": "codex-project-memory",
-  "version": "1.0.0+codex.20260816224259",
+  "version": "1.0.0+codex.20260816230633",
   "description": "Integrated project memory and persistent role orchestration for long-running Codex development.",
   "author": {
     "name": "Local developer"

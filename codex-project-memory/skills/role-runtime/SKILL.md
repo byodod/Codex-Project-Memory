@@ -9,6 +9,50 @@ Use `role_runtime` for role identity, routing, ownership, mailboxes, policies, a
 
 Codex desktop task tools are the only task transport. The Role Runtime MCP stores state; it never queries, creates, resumes, archives, or runs Codex tasks and never invokes Codex CLI or App Server.
 
+## Desktop task transport contract
+
+Treat these desktop calls as exact argument whitelists:
+
+```js
+list_projects({})
+list_threads({ limit: 50 })
+
+create_thread({
+  target: {
+    type: "project",
+    projectId,
+    environment: { type: "local" }
+  },
+  prompt,
+  title
+})
+
+read_thread({
+  threadId,
+  hostId,
+  includeOutputs: true,
+  turnLimit: 5,
+  maxOutputCharsPerItem: 12000
+})
+
+send_message_to_thread({
+  threadId,
+  hostId,
+  prompt
+})
+
+wait_threads({
+  targets: [{ threadId, hostId }],
+  timeoutMs: 120000
+})
+```
+
+Call `list_projects({})` first and use the `projectId` whose normalized project path equals the current project root. `projectId` belongs only at `create_thread.target.projectId`; never add a second top-level `projectId` beside `target`. Persistent roles use `local` so they share the live project checkout. Use a worktree only when the user explicitly requests isolation; then replace `environment` with `{ type: "worktree", startingState: { type: "working-tree" } }` without changing the location of `projectId`.
+
+Search both `pinnedThreads` and `threads` from `list_threads`, match an existing binding by exact `threadId`, and carry its returned `hostId` into read/send/wait calls. `read_thread` accepts only `threadId`, optional `hostId`, `cursor`, `includeOutputs`, `maxOutputCharsPerItem`, and `turnLimit`. `send_message_to_thread` accepts only `threadId`, `prompt`, optional `hostId`, `model`, and `thinking`; its message field is named `prompt`, never `message`, `content`, `taskId`, `projectId`, or `target`.
+
+Only set `model` and `thinking` on create/send when user or project instructions require them, and use the canonical model id exposed by the desktop tool, such as `gpt-5.6-luna` with `thinking: "max"`. If creation returns `threadId`, attach it. If it returns only `clientThreadId`, setup is pending: do not pass that value to read/send/wait/`role_attach`, do not call `create_thread` again, and do not fall back to `fork_thread`. Resolve the one pending task through `list_threads` until its real `threadId` and `hostId` are available, then attach it. After sending, wait with `wait_threads({ targets: [{ threadId, hostId }], timeoutMs })`; reuse any returned cursor as that target's `afterCursor` on a later wait.
+
 ## One-prompt initialization
 
 When the user sends exactly `初始化角色编排`, `启动角色编排`, or `initialize role orchestration`, the Hook creates Liaison, Coordinator, Architect, and Verifier definitions and binds the current task as the sole user-facing Liaison. If another Liaison is active, the current task replaces it.
@@ -17,7 +61,7 @@ In that same model turn:
 
 1. Call `role_runtime.status` and `project_memory.task_get` with the current `cwd`.
 2. Use Codex desktop `list_projects` and `list_threads`/`read_thread` to inspect the attached Coordinator task.
-3. If no Coordinator is attached, or its task is missing, archived, deleted, or unavailable, call desktop `create_thread` for a local task in the current project. Give it the Coordinator anchor and tell it to await routed work.
+3. If no Coordinator is attached, or its task is missing, archived, deleted, or unavailable, create one task using the exact desktop task transport contract above. Give it the Coordinator anchor and tell it to await routed work.
 4. Call `role_runtime.role_attach` with the returned task id. Supplying a different id retires the old generation atomically.
 5. Confirm Liaison and Coordinator readiness. Do not expose internal task ids unless debugging requires them.
 
@@ -40,7 +84,7 @@ The Liaison does not implement, schedule, architect, or verify internal work. Th
 
 - Keep the Role Runtime task graph aligned with the Project Memory goal, acceptance criteria, completed items, blockers, and next steps.
 - Persist internal traffic with `message_send`. It returns the recipient's desktop task id or `needs_task`; it never wakes a task itself.
-- For a missing, archived, deleted, or unavailable role task, create a new local desktop task and call `role_attach`. Then use desktop send/wait/read tools.
+- For a missing, archived, deleted, or unavailable role task, create exactly one replacement with the desktop task transport contract, wait for its real `threadId`, and call `role_attach`. Then use the exact send/wait/read shapes above.
 - Store role charters and invariants with `role_state_put`; store reusable cross-role project facts with `project_memory.memory_store` using honest provenance.
 - Give writable workers bounded change envelopes. Record meaningful test/build/review evidence with `verification_record`.
 - Use a fresh Verifier generation when independence matters. Complete Project Memory only after criteria pass and blockers/next steps are empty.
