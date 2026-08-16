@@ -68,11 +68,13 @@ export interface MemoryRecord {
   tags: string[];
   superseded_by: string | null;
   recall_count: number;
+  last_recalled_at?: string | null;
   created_at: string;
   updated_at: string;
   verified_at: string | null;
   expires_at: string | null;
   score?: number;
+  rank?: number;
 }
 
 export interface HookInput {

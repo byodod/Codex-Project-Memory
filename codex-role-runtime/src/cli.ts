@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { resolveCodexBinary } from "./app-server.js";
-import { rotateRoleGeneration } from "./generation-service.js";
+import { rotateRoleGeneration, startRoleGeneration } from "./generation-service.js";
 import { resolveProject } from "./project.js";
 import { RoleStore } from "./store.js";
 import { initializeStandardTopology } from "./topology.js";
@@ -11,9 +11,9 @@ function positional(): string[] { return raw.filter((value, index) => !value.sta
 const args = positional(); const command = args[0] || "status"; const cwd = option("--cwd") || process.cwd();
 const store = new RoleStore(); const project = resolveProject(cwd);
 
-function generationOptions(): { model?: string; deterministicBootstrap: boolean } {
+function generationOptions(): { model?: string } {
   const model = option("--model");
-  return { ...(model ? { model } : {}), deterministicBootstrap: raw.includes("--deterministic-bootstrap") };
+  return { ...(model ? { model } : {}) };
 }
 
 try {
@@ -32,8 +32,7 @@ try {
     case "context": output = store.context(project, args[1] || ""); break;
     case "rotate": output = await rotateRoleGeneration(store, project, args[1] || "", option("--reason") || "manual rotation", generationOptions()); break;
     case "start":
-      if (store.activeGeneration(project, args[1] || "")) throw new Error("Role already has an active generation; use rotate.");
-      output = await rotateRoleGeneration(store, project, args[1] || "", option("--reason") || "initial generation", generationOptions());
+      output = await startRoleGeneration(store, project, args[1] || "", generationOptions());
       break;
     case "open": case "continue": {
       const active = store.activeGeneration(project, args[1] || ""); if (!active) throw new Error("Role has no active generation.");

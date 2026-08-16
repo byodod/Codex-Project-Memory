@@ -21,10 +21,10 @@ Use the `role_runtime` MCP tools as the authoritative control plane. Role identi
 
 When the user sends exactly `初始化角色编排`, `启动角色编排`, or `initialize role orchestration`, the `UserPromptSubmit` hook idempotently creates the standard Liaison, Coordinator, Architect, and Verifier topology and binds the current task to `role://liaison`.
 
-After the hook binds the Liaison:
+The Hook starts the Coordinator itself before the Liaison model turn. After it binds the Liaison:
 
 1. Call `status` with the current `cwd`.
-2. If the Coordinator has no active generation, call `role_start` for `coordinator`. Do this as part of the same initialization turn; do not ask the user to run a CLI command.
+2. Confirm the Coordinator is active. If startup was interrupted, call the idempotent `role_start` for `coordinator` to recover it; do not ask the user to run a CLI command.
 3. Confirm that the user-facing entry and Coordinator are ready. Do not expose internal thread ids.
 
 For each later substantive user request, clarify only material ambiguity, then call `liaison_request` with the current Liaison generation and a faithful structured request. Translate the returned Coordinator response into concise user-facing language. Do not implement, schedule, architect, or verify work inside the Liaison task.
@@ -55,14 +55,14 @@ Preferred one-command flow:
 
 `node <plugin-root>/dist/cli.mjs rotate <role-key> --cwd <project> --reason <reason>`
 
-The CLI performs `ROTATION_PENDING → DRAINING → CHECKPOINTING → VALIDATING → BOOTSTRAPPING → CUTOVER`, creates a new thread through Codex App Server, sets its native goal, validates structured bootstrap output, and switches atomically. If bootstrap fails, the candidate is rejected and the old generation stays active.
+The CLI performs `ROTATION_PENDING → DRAINING → CHECKPOINTING → VALIDATING → BOOTSTRAPPING → CUTOVER`, creates a new thread through Codex App Server, validates an authoritative bootstrap packet locally, and switches atomically. Initialization does not set an active native goal or wait for a model echo. If bootstrap fails, the candidate is rejected and the old generation stays active.
 
 For an external driver, use `rotation_prepare`, `rotation_candidate_register`, and `rotation_cutover` in that order.
 
 ## Hooks
 
 - `SessionStart` and `UserPromptSubmit` inject a compact role anchor; an exact initialization prompt creates the standard topology and binds the current task as Liaison.
-- `UserPromptSubmit` and `PreToolUse` reject retired generations.
+- `UserPromptSubmit` and `PreToolUse` reject retired generations and prevent bootstrapping candidates from starting recursive work before cutover.
 - `PreToolUse` enforces the role's denied-tool policy.
 - `PreCompact` records a checkpoint event; `PostCompact` increments generation health once per event.
 - Hook events are advisory evidence except for explicit stale-generation and tool-policy blocks.

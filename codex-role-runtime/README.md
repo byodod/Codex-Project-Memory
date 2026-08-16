@@ -1,5 +1,7 @@
 # Codex Role Runtime
 
+This directory is the independently tested Role Runtime source component. The user-facing distribution is now the unified `codex-project-memory` plugin in the sibling directory, which bundles this MCP server, Hook, CLI, and role skill together with Project Memory. The standalone installer remains available only for isolated development and recovery.
+
 Codex Role Runtime is a local Codex plugin for **persistent roles over replaceable thread generations**. It keeps role identity, semantic ownership, task state, typed messages, architecture epochs, and verification envelopes outside the model context, so an aging or repeatedly compacted Codex thread can be retired without losing the role.
 
 The implementation is Codex-native:
@@ -8,7 +10,7 @@ The implementation is Codex-native:
 - Hooks restore a compact role anchor, reject retired generations, enforce role tool policy, and track compaction health.
 - MCP exposes the durable Role / Generation / Task / Message / Ownership / Rotation control plane.
 - SQLite provides atomic cutover, idempotency, crash recovery, and hard invariants.
-- The CLI creates and resumes top-level Codex threads through App Server and performs structured bootstrap health checks.
+- The CLI creates and resumes top-level Codex threads through App Server and deterministically activates them from authoritative SQLite role state.
 - Native Codex subagents remain the right execution mechanism for disposable workers; the runtime does not replace them.
 
 No OpenAI API key is required. Codex App Server uses the user's existing Codex authentication.
@@ -63,7 +65,7 @@ That single prompt:
 
 1. Creates the standard four-role topology idempotently.
 2. Permanently binds the current task to `role://liaison` as the user's entry point.
-3. Starts and validates the first `role://coordinator` task through Codex App Server.
+3. The Hook itself starts and deterministically activates the first `role://coordinator` task through Codex App Server before the Liaison model turn begins.
 4. Keeps later user requests flowing through `liaison_request`, which wakes the Coordinator and returns its result to the Liaison.
 
 The four intentionally narrow, read-only long-lived roles are:
@@ -120,7 +122,7 @@ ROTATION_PENDING → DRAINING → CHECKPOINTING → VALIDATING
 → BOOTSTRAPPING → CUTOVER → COMPLETED
 ```
 
-The new thread first returns a structured health packet. The runtime compares its role id, mission, owned domains, critical invariants, open questions, and architecture epoch with SQLite. Only a match permits cutover.
+The runtime builds the candidate's bootstrap packet from authoritative SQLite role state, validates it locally, and then performs atomic cutover. Startup does not set an active native goal or wait for a model-generated health echo, so initialization cannot accidentally launch competing model turns. A failed attempt rejects its candidate before a retry.
 
 ## MCP surface
 
@@ -145,7 +147,7 @@ Only L3 is expected to die during generation rotation.
 
 ## Current Codex boundary
 
-The local Codex CLI reports App Server as experimental in version `0.147.0`, although its protocol documents `thread/start`, `turn/start`, thread goals, generated schemas, and streamed completion events. The runtime isolates this behind `AppServerClient`; SQLite state, MCP, Hooks, and all core invariants do not depend on the transport implementation. If the App Server bootstrap fails, no active-generation pointer is changed.
+The local Codex CLI reports App Server as experimental in version `0.147.0`, although its protocol documents `thread/start`, `turn/start`, thread goals, generated schemas, and streamed completion events. The runtime isolates this behind `AppServerClient`; SQLite state, MCP, Hooks, and all core invariants do not depend on the transport implementation. Creating a role generation only needs `thread/start`; model turns begin later when real work is dispatched. If startup fails, no active-generation pointer is changed and the candidate is rejected.
 
 Official references:
 

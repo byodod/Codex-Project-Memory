@@ -69,7 +69,8 @@ export interface EventInput {
 }
 
 function dataRoot(explicit?: string): string {
-  return explicit || process.env.PLUGIN_DATA || process.env.CODEX_PROJECT_MEMORY_HOME || join(homedir(), ".codex-project-memory");
+  const codexHome = process.env.CODEX_HOME || join(homedir(), ".codex");
+  return explicit || process.env.CODEX_PROJECT_MEMORY_HOME || process.env.PLUGIN_DATA || join(codexHome, "plugin-data", "codex-project-memory");
 }
 
 function taskFromRow(row?: SqlRow): TaskRecord | null {
@@ -94,7 +95,8 @@ function memoryFromRow(row: SqlRow): MemoryRecord {
     importance: Number(row.importance),
     recall_count: Number(row.recall_count),
     tags: safeJsonParse(row.tags, []),
-    score: row.score === undefined ? undefined : Number(row.score)
+    score: row.score === undefined ? undefined : Number(row.score),
+    rank: row.rank === undefined ? undefined : Number(row.rank)
   };
 }
 
@@ -433,12 +435,14 @@ export class MemoryStore {
       if (options.taskId && memory.task_id === options.taskId) score += 2;
       if (["user_decision", "project_authority"].includes(memory.authority)) score += 1.5;
       if (memory.kind === "failure") score += 0.5;
+      if (memory.rank !== undefined && memory.rank < 0) score += Math.min(8, -memory.rank);
       return { ...memory, score };
     }).sort((a, b) => (b.score ?? 0) - (a.score ?? 0)).slice(0, limit);
     if (scored.length) {
       const timestamp = nowIso();
       const update = this.db.prepare("UPDATE memories SET recall_count=recall_count+1,last_recalled_at=? WHERE id=?");
       for (const memory of scored) update.run(timestamp, memory.id);
+      return scored.map((memory) => ({ ...memory, recall_count: memory.recall_count + 1, last_recalled_at: timestamp }));
     }
     return scored;
   }

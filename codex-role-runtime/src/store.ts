@@ -70,7 +70,7 @@ export class RoleStore {
 
   constructor(root?: string) {
     const codexHome = process.env.CODEX_HOME || join(homedir(), ".codex");
-    this.root = root || process.env.PLUGIN_DATA || process.env.CODEX_ROLE_RUNTIME_HOME || join(codexHome, "plugin-data", "codex-role-runtime");
+    this.root = root || process.env.CODEX_ROLE_RUNTIME_HOME || process.env.PLUGIN_DATA || join(codexHome, "plugin-data", "codex-role-runtime");
     mkdirSync(this.root, { recursive: true });
     this.databasePath = join(this.root, "role-runtime.sqlite3");
     this.db = new DatabaseSync(this.databasePath);
@@ -280,6 +280,18 @@ export class RoleStore {
     return row ? generationFromRow(row) : null;
   }
 
+  bootstrappingGeneration(project: ProjectContext, roleKey: string): GenerationRecord | null {
+    const role = this.getRole(project, roleKey); if (!role) return null;
+    const row = this.db.prepare("SELECT * FROM role_generations WHERE role_id=? AND status='bootstrapping'").get(role.id) as Row | undefined;
+    return row ? generationFromRow(row) : null;
+  }
+
+  openRotation(project: ProjectContext, roleKey: string): Row | null {
+    const role = this.getRole(project, roleKey); if (!role) return null;
+    const row = this.db.prepare("SELECT * FROM rotations WHERE role_id=? AND state NOT IN ('COMPLETED','FAILED') ORDER BY created_at DESC LIMIT 1").get(role.id) as Row | undefined;
+    return row || null;
+  }
+
   bindInitial(project: ProjectContext, roleKey: string, threadId: string): GenerationRecord {
     const role = this.getRole(project, roleKey); if (!role) throw new Error(`Unknown role: ${roleKey}`);
     const existingThread = this.db.prepare("SELECT * FROM role_generations WHERE thread_id=?").get(threadId) as Row | undefined;
@@ -302,12 +314,10 @@ export class RoleStore {
 
   createCandidate(project: ProjectContext, roleKey: string, threadId: string, bootstrapHash?: string): GenerationRecord {
     const role = this.getRole(project, roleKey); if (!role) throw new Error(`Unknown role: ${roleKey}`);
-    const current = this.activeGeneration(project, roleKey);
     const max = this.db.prepare("SELECT coalesce(max(generation_number),0) n FROM role_generations WHERE role_id=?").get(role.id) as Row;
     const number = Number(max.n) + 1; const time = nowIso(); const id = newId("gen");
     this.db.prepare(`INSERT INTO role_generations(id,role_id,generation_number,thread_id,status,health,architecture_epoch,bootstrap_hash,started_at,last_seen_at)
       VALUES(?,?,?,?,?,?,?,?,?,?)`).run(id, role.id, number, threadId, "bootstrapping", "healthy", this.projectEpoch(project), bootstrapHash || null, time, time);
-    if (!current && number !== 1) throw new Error("INVALID_INITIAL_GENERATION");
     return generationFromRow(this.db.prepare("SELECT * FROM role_generations WHERE id=?").get(id) as Row);
   }
 
@@ -518,9 +528,9 @@ export class RoleStore {
     };
   }
 
-  roleAnchor(project: ProjectContext, roleKey: string): string {
+  roleAnchor(project: ProjectContext, roleKey: string, generationOverride?: GenerationRecord): string {
     const context = this.context(project, roleKey); const role = context.role as RoleRecord;
-    const generation = context.active_generation as GenerationRecord | null;
+    const generation = generationOverride ?? (context.active_generation as GenerationRecord | null);
     const facts = context.facts as Row[]; const invariants = facts.filter((fact) => fact.kind === "invariant").slice(0, 8);
     const tasks = context.tasks as Row[];
     const interactionContract = role.role_key === "liaison"
@@ -531,7 +541,7 @@ export class RoleStore {
     return [
       "[Codex Role Runtime]",
       `Role: ${role.name} (role://${role.role_key})`,
-      `Generation: ${generation?.generation_number ?? "unbound"}; Architecture epoch: ${(context.project as Row).architecture_epoch}`,
+      `Generation: ${generation?.generation_number ?? "unbound"}${generation ? ` (${generation.status})` : ""}; Architecture epoch: ${(context.project as Row).architecture_epoch}`,
       `Mission: ${role.mission}`,
       `Owns: ${role.owned_domains.join(", ") || "none declared"}`,
       `Does not own: ${role.excluded_domains.join(", ") || "none declared"}`,

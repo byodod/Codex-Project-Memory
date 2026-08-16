@@ -8,7 +8,7 @@ import { RoleStore, resolveProject } from "../dist/library.mjs";
 
 const hook = resolve("dist/hook.mjs");
 function invoke(cwd, data, input) {
-  const run = spawnSync(process.execPath, ["--no-warnings", hook], { cwd, env: { ...process.env, CODEX_ROLE_RUNTIME_HOME: data }, input: JSON.stringify(input), encoding: "utf8" });
+  const run = spawnSync(process.execPath, ["--no-warnings", hook], { cwd, env: { ...process.env, CODEX_ROLE_RUNTIME_HOME: data, CODEX_ROLE_RUNTIME_TEST_COORDINATOR_THREAD: "thr-test-coordinator" }, input: JSON.stringify(input), encoding: "utf8" });
   assert.equal(run.status, 0, run.stderr); return run.stdout.trim() ? JSON.parse(run.stdout) : {};
 }
 
@@ -25,7 +25,8 @@ test("one prompt initializes the standard topology and binds this task as the us
   const store = new RoleStore(data); const project = resolveProject(cwd);
   assert.deepEqual(store.listRoles(project).map((role) => role.role_key).sort(), ["architect", "coordinator", "liaison", "verifier"]);
   assert.equal(store.activeGeneration(project, "liaison").thread_id, "thr-user");
-  assert.equal(store.db.prepare("SELECT count(*) n FROM role_generations").get().n, 1);
+  assert.equal(store.activeGeneration(project, "coordinator").thread_id, "thr-test-coordinator");
+  assert.equal(store.db.prepare("SELECT count(*) n FROM role_generations").get().n, 2);
   store.close();
 
   const duplicate = invoke(cwd, data, { session_id: "thr-other", turn_id: "t0", cwd, hook_event_name: "UserPromptSubmit", prompt: "initialize role orchestration" });
@@ -75,4 +76,20 @@ test("retired generation prompt and tool calls are blocked", () => {
   assert.equal(prompt.decision, "block"); assert.match(prompt.reason, /STALE_GENERATION/);
   const tool = invoke(cwd, data, { session_id: "thr-old", turn_id: "t1", tool_use_id: "u1", cwd, hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "echo hi" } });
   assert.equal(tool.hookSpecificOutput.permissionDecision, "deny");
+});
+
+test("bootstrapping generation receives context but cannot recurse or use tools before cutover", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "codex-role-bootstrap-project-")); const data = mkdtempSync(join(tmpdir(), "codex-role-bootstrap-data-"));
+  const store = new RoleStore(data); const project = resolveProject(cwd);
+  store.defineRole(project, { role_key: "coordinator", mission: "Coordinate work.", policy: { mode: "read_only" } });
+  store.createCandidate(project, "coordinator", "thr-candidate"); store.close();
+
+  const start = invoke(cwd, data, { session_id: "thr-candidate", cwd, hook_event_name: "SessionStart", source: "startup" });
+  assert.match(start.hookSpecificOutput.additionalContext, /bootstrap candidate/i);
+  assert.match(start.hookSpecificOutput.additionalContext, /Generation: 1 \(bootstrapping\)/);
+  const prompt = invoke(cwd, data, { session_id: "thr-candidate", turn_id: "t1", cwd, hook_event_name: "UserPromptSubmit", prompt: "初始化角色编排" });
+  assert.equal(prompt.decision, "block"); assert.match(prompt.reason, /BOOTSTRAPPING_GENERATION/);
+  const tool = invoke(cwd, data, { session_id: "thr-candidate", turn_id: "t1", tool_use_id: "u1", cwd, hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "git status --short" } });
+  assert.equal(tool.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(tool.hookSpecificOutput.permissionDecisionReason, /BOOTSTRAPPING_GENERATION/);
 });

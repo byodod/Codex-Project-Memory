@@ -1,213 +1,32 @@
-// src/cli.ts
-import { spawnSync } from "node:child_process";
+// ../codex-role-runtime/src/types.ts
+var ROLE_KINDS = ["governance", "owner", "worker"];
+var GENERATION_STATUSES = ["bootstrapping", "active", "retired", "rejected"];
+var MESSAGE_TYPES = [
+  "ASSIGN",
+  "QUESTION",
+  "ANSWER",
+  "PROPOSAL",
+  "DECISION_REQUEST",
+  "DECISION",
+  "HANDOFF",
+  "VERIFY_REQUEST",
+  "RESULT",
+  "BLOCKED"
+];
+var FACT_KINDS = [
+  "charter",
+  "ownership",
+  "architecture",
+  "decision",
+  "task_state",
+  "open_question",
+  "failure",
+  "invariant",
+  "dependency",
+  "artifact"
+];
 
-// src/app-server.ts
-import { execFileSync, spawn } from "node:child_process";
-import { createInterface } from "node:readline";
-function resolveCodexBinary() {
-  if (process.env.CODEX_BIN) {
-    return process.env.CODEX_BIN;
-  }
-  if (process.platform === "win32") {
-    try {
-      const candidates = execFileSync("where.exe", ["codex.cmd"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
-      if (candidates[0]) return candidates[0];
-    } catch {
-    }
-  }
-  return "codex";
-}
-var AppServerClient = class _AppServerClient {
-  child;
-  lines;
-  nextId = 1;
-  pending = /* @__PURE__ */ new Map();
-  listeners = /* @__PURE__ */ new Set();
-  stderr = [];
-  constructor(command2 = resolveCodexBinary()) {
-    this.child = spawn(command2, ["app-server", "--stdio"], {
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-      shell: process.platform === "win32" && !command2.toLowerCase().endsWith(".exe")
-    });
-    this.lines = createInterface({ input: this.child.stdout });
-    this.lines.on("line", (line) => this.onLine(line));
-    this.child.stderr.setEncoding("utf8");
-    this.child.stderr.on("data", (chunk) => {
-      this.stderr.push(chunk);
-      if (this.stderr.length > 50) this.stderr.shift();
-    });
-    this.child.on("exit", (code) => {
-      for (const waiter of this.pending.values()) {
-        clearTimeout(waiter.timer);
-        waiter.reject(new Error(`Codex app-server exited with ${code}. ${this.stderr.join("").slice(-2e3)}`));
-      }
-      this.pending.clear();
-    });
-  }
-  static async connect() {
-    const client = new _AppServerClient();
-    await client.request("initialize", { clientInfo: { name: "codex-role-runtime", title: "Codex Role Runtime", version: "1.0.0" } });
-    client.notify("initialized", {});
-    return client;
-  }
-  onLine(line) {
-    let message;
-    try {
-      message = JSON.parse(line);
-    } catch {
-      return;
-    }
-    if (typeof message.id === "number" && (message.result !== void 0 || message.error !== void 0)) {
-      const waiter = this.pending.get(message.id);
-      if (!waiter) return;
-      clearTimeout(waiter.timer);
-      this.pending.delete(message.id);
-      if (message.error) waiter.reject(new Error(`App Server RPC error: ${JSON.stringify(message.error)}`));
-      else waiter.resolve(message.result);
-      return;
-    }
-    for (const listener of this.listeners) listener(message);
-  }
-  request(method, params, timeoutMs = 3e4) {
-    const id = this.nextId++;
-    return new Promise((resolve2, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`App Server timeout: ${method}`));
-      }, timeoutMs);
-      this.pending.set(id, { resolve: resolve2, reject, timer });
-      this.child.stdin.write(`${JSON.stringify({ method, id, params })}
-`);
-    });
-  }
-  notify(method, params) {
-    this.child.stdin.write(`${JSON.stringify({ method, params })}
-`);
-  }
-  async startThread(input) {
-    const params = {
-      cwd: input.cwd,
-      approvalPolicy: "never",
-      sandbox: input.policy.mode === "read_only" ? "read-only" : "workspace-write",
-      serviceName: "codex-role-runtime"
-    };
-    if (input.model) params.model = input.model;
-    const result = await this.request("thread/start", params, 6e4);
-    const threadId = result?.thread?.id;
-    if (!threadId) throw new Error(`thread/start returned no thread id: ${JSON.stringify(result)}`);
-    await this.request("thread/name/set", { threadId, name: input.name }).catch(() => void 0);
-    return threadId;
-  }
-  async resumeThread(threadId) {
-    const result = await this.request("thread/resume", { threadId }, 6e4);
-    if (result?.thread?.id !== threadId) throw new Error(`thread/resume returned the wrong thread: ${JSON.stringify(result)}`);
-  }
-  async runTurn(threadId, prompt, timeoutMs = 9e5) {
-    await this.resumeThread(threadId);
-    let lastText = "";
-    const completed = new Promise((resolve2, reject) => {
-      const timer = setTimeout(() => {
-        this.listeners.delete(listener);
-        reject(new Error("Role dispatch turn timed out."));
-      }, timeoutMs);
-      const listener = (message) => {
-        const params = message.params || {};
-        if (params.threadId && params.threadId !== threadId) return;
-        if (message.method === "item/agentMessage/delta") lastText += params.delta || "";
-        if (message.method === "item/completed" && params.item?.type === "agentMessage") lastText = params.item.text || lastText;
-        if (message.method === "turn/completed") {
-          clearTimeout(timer);
-          this.listeners.delete(listener);
-          if (params.turn?.status && !["completed", "Completed"].includes(params.turn.status)) reject(new Error(`Role dispatch turn ${params.turn.status}`));
-          else resolve2();
-        }
-      };
-      this.listeners.add(listener);
-    });
-    await this.request("turn/start", { threadId, input: [{ type: "text", text: prompt }] }, 6e4);
-    await completed;
-    return lastText.trim();
-  }
-  close() {
-    this.lines.close();
-    this.child.stdin.end();
-    this.child.kill();
-  }
-};
-
-// src/generation-service.ts
-function expectedBootstrap(store2, project2, role) {
-  const context = store2.context(project2, role.role_key);
-  const facts = context.facts;
-  return {
-    role_id: role.role_key,
-    mission: role.mission,
-    owned_domains: role.owned_domains,
-    critical_invariants: facts.filter((fact) => fact.kind === "invariant").map((fact) => String(fact.content)),
-    open_questions: facts.filter((fact) => fact.kind === "open_question").map((fact) => String(fact.content)),
-    architecture_epoch: Number(context.project.architecture_epoch)
-  };
-}
-async function rotateRoleGeneration(store2, project2, roleKey, reason, options = {}) {
-  const role = store2.getRole(project2, roleKey);
-  if (!role) throw new Error(`Unknown role: ${roleKey}`);
-  const rotation = store2.createRotation(project2, roleKey, reason);
-  let client = null;
-  let candidate = null;
-  try {
-    client = options.clientFactory ? await options.clientFactory() : await AppServerClient.connect();
-    store2.updateRotation(String(rotation.id), "DRAINING");
-    store2.updateRotation(String(rotation.id), "CHECKPOINTING");
-    store2.updateRotation(String(rotation.id), "VALIDATING");
-    const threadId = await client.startThread({ cwd: project2.root, ...options.model ? { model: options.model } : {}, policy: role.policy, name: `${role.name} \xB7 Generation` });
-    const expected = expectedBootstrap(store2, project2, role);
-    candidate = store2.createCandidate(project2, roleKey, threadId, JSON.stringify(expected));
-    store2.updateRotation(String(rotation.id), "BOOTSTRAPPING", { candidateId: candidate.id });
-    const validation = store2.validateBootstrap(project2, roleKey, expected);
-    if (!validation.ok) {
-      store2.rejectCandidate(candidate.id, validation.errors.join("; "));
-      store2.updateRotation(String(rotation.id), "FAILED", { error: validation.errors.join("; ") });
-      throw new Error(`Bootstrap rejected: ${validation.errors.join("; ")}`);
-    }
-    store2.updateRotation(String(rotation.id), "CUTOVER");
-    const active = store2.activateCandidate(project2, roleKey, candidate.id, reason);
-    store2.updateRotation(String(rotation.id), "COMPLETED");
-    return { rotation_id: rotation.id, role: roleKey, generation: active, validation };
-  } catch (error) {
-    if (candidate) {
-      try {
-        store2.rejectCandidate(candidate.id, `Bootstrap failed: ${error instanceof Error ? error.message : String(error)}`);
-      } catch {
-      }
-    }
-    try {
-      store2.updateRotation(String(rotation.id), "FAILED", { error: error instanceof Error ? error.message : String(error) });
-    } catch {
-    }
-    throw error;
-  } finally {
-    client?.close();
-  }
-}
-async function startRoleGeneration(store2, project2, roleKey, options = {}) {
-  const active = store2.activeGeneration(project2, roleKey);
-  if (active) return { role: roleKey, status: "active", started: false, generation: active };
-  const candidate = store2.bootstrappingGeneration(project2, roleKey);
-  const rotation = store2.openRotation(project2, roleKey);
-  if (candidate && rotation) return { role: roleKey, status: "bootstrapping", started: false, generation: candidate, rotation_id: rotation.id };
-  if (candidate) store2.rejectCandidate(candidate.id, "Recovered orphaned bootstrap candidate before retrying role_start.");
-  if (rotation) return { role: roleKey, status: "starting", started: false, rotation_id: rotation.id };
-  const result = await rotateRoleGeneration(store2, project2, roleKey, "initial generation", options);
-  return { ...result, status: "active", started: true };
-}
-
-// src/project.ts
-import { execFileSync as execFileSync2 } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
-import { basename, dirname, resolve } from "node:path";
-
-// src/util.ts
+// ../codex-role-runtime/src/util.ts
 import { createHash, randomUUID } from "node:crypto";
 function nowIso() {
   return (/* @__PURE__ */ new Date()).toISOString();
@@ -256,11 +75,18 @@ function matchesAny(value, patterns) {
     }
   });
 }
+function redact(value) {
+  const text = JSON.stringify(value ?? null);
+  return JSON.parse(text.replace(/(sk-[A-Za-z0-9_-]{16,}|Bearer\s+[A-Za-z0-9._-]{16,})/gi, "[REDACTED]"));
+}
 
-// src/project.ts
-function git(cwd2, args2) {
+// ../codex-role-runtime/src/project.ts
+import { execFileSync } from "node:child_process";
+import { existsSync, realpathSync } from "node:fs";
+import { basename, dirname, resolve } from "node:path";
+function git(cwd, args) {
   try {
-    return execFileSync2("git", args2, { cwd: cwd2, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() || null;
+    return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() || null;
   } catch {
     return null;
   }
@@ -285,7 +111,7 @@ function resolveProject(input = process.cwd()) {
   };
 }
 
-// src/store.ts
+// ../codex-role-runtime/src/store.ts
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
@@ -456,25 +282,25 @@ var RoleStore = class {
       throw error;
     }
   }
-  ensureProject(project2) {
+  ensureProject(project) {
     const time = nowIso();
     this.db.prepare(`INSERT INTO projects(id,root,name,remote,git_common_dir,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET root=excluded.root,name=excluded.name,remote=excluded.remote,
-      git_common_dir=excluded.git_common_dir,updated_at=excluded.updated_at`).run(project2.id, project2.root, project2.name, project2.remote, project2.gitCommonDir, time, time);
-    return this.db.prepare("SELECT * FROM projects WHERE id=?").get(project2.id);
+      git_common_dir=excluded.git_common_dir,updated_at=excluded.updated_at`).run(project.id, project.root, project.name, project.remote, project.gitCommonDir, time, time);
+    return this.db.prepare("SELECT * FROM projects WHERE id=?").get(project.id);
   }
-  configureProject(project2, constitution) {
-    this.ensureProject(project2);
-    if (constitution !== void 0) this.db.prepare("UPDATE projects SET constitution=?,updated_at=? WHERE id=?").run(compactText(constitution, 12e3), nowIso(), project2.id);
-    return this.db.prepare("SELECT * FROM projects WHERE id=?").get(project2.id);
+  configureProject(project, constitution) {
+    this.ensureProject(project);
+    if (constitution !== void 0) this.db.prepare("UPDATE projects SET constitution=?,updated_at=? WHERE id=?").run(compactText(constitution, 12e3), nowIso(), project.id);
+    return this.db.prepare("SELECT * FROM projects WHERE id=?").get(project.id);
   }
-  projectEpoch(project2) {
-    return Number(this.ensureProject(project2).architecture_epoch);
+  projectEpoch(project) {
+    return Number(this.ensureProject(project).architecture_epoch);
   }
-  defineRole(project2, input) {
-    this.ensureProject(project2);
+  defineRole(project, input) {
+    this.ensureProject(project);
     const key = slug(input.role_key);
-    const existing = this.db.prepare("SELECT * FROM roles WHERE project_id=? AND role_key=?").get(project2.id, key);
+    const existing = this.db.prepare("SELECT * FROM roles WHERE project_id=? AND role_key=?").get(project.id, key);
     const policy = {
       ...DEFAULT_POLICY,
       ...existing ? parseJson(existing.policy, DEFAULT_POLICY) : {},
@@ -491,7 +317,7 @@ var RoleStore = class {
       mission=excluded.mission,owned_domains=excluded.owned_domains,excluded_domains=excluded.excluded_domains,
       escalation_rules=excluded.escalation_rules,policy=excluded.policy,updated_at=excluded.updated_at`).run(
       id,
-      project2.id,
+      project.id,
       key,
       compactText(input.name || key, 200),
       input.kind || "owner",
@@ -503,16 +329,16 @@ var RoleStore = class {
       existing ? String(existing.created_at) : time,
       time
     );
-    return this.getRole(project2, key);
+    return this.getRole(project, key);
   }
-  getRole(project2, roleKey) {
-    this.ensureProject(project2);
-    const row = this.db.prepare("SELECT * FROM roles WHERE project_id=? AND role_key=?").get(project2.id, slug(roleKey));
+  getRole(project, roleKey) {
+    this.ensureProject(project);
+    const row = this.db.prepare("SELECT * FROM roles WHERE project_id=? AND role_key=?").get(project.id, slug(roleKey));
     return row ? roleFromRow(row) : null;
   }
-  listRoles(project2) {
-    this.ensureProject(project2);
-    const rows = this.db.prepare("SELECT * FROM roles WHERE project_id=? ORDER BY kind,role_key").all(project2.id);
+  listRoles(project) {
+    this.ensureProject(project);
+    const rows = this.db.prepare("SELECT * FROM roles WHERE project_id=? ORDER BY kind,role_key").all(project.id);
     return rows.map((row) => {
       const role = roleFromRow(row);
       const active = this.db.prepare("SELECT * FROM role_generations WHERE role_id=? AND status='active'").get(role.id);
@@ -520,11 +346,11 @@ var RoleStore = class {
       return { ...role, active_generation: active ? generationFromRow(active) : null, pending_messages: Number(count.count) };
     });
   }
-  getGenerationByThread(project2, threadId) {
-    this.ensureProject(project2);
+  getGenerationByThread(project, threadId) {
+    this.ensureProject(project);
     const row = this.db.prepare(`SELECT g.*,r.project_id role_project_id,r.role_key,r.name role_name,r.kind role_kind,
       r.mission,r.owned_domains,r.excluded_domains,r.escalation_rules,r.policy,r.created_at role_created_at,r.updated_at role_updated_at
-      FROM role_generations g JOIN roles r ON r.id=g.role_id WHERE g.thread_id=? AND r.project_id=?`).get(threadId, project2.id);
+      FROM role_generations g JOIN roles r ON r.id=g.role_id WHERE g.thread_id=? AND r.project_id=?`).get(threadId, project.id);
     if (!row) return null;
     const role = roleFromRow({
       id: row.role_id,
@@ -542,36 +368,36 @@ var RoleStore = class {
     });
     return { role, generation: generationFromRow(row) };
   }
-  activeGeneration(project2, roleKey) {
-    const role = this.getRole(project2, roleKey);
+  activeGeneration(project, roleKey) {
+    const role = this.getRole(project, roleKey);
     if (!role) return null;
     const row = this.db.prepare("SELECT * FROM role_generations WHERE role_id=? AND status='active'").get(role.id);
     return row ? generationFromRow(row) : null;
   }
-  bootstrappingGeneration(project2, roleKey) {
-    const role = this.getRole(project2, roleKey);
+  bootstrappingGeneration(project, roleKey) {
+    const role = this.getRole(project, roleKey);
     if (!role) return null;
     const row = this.db.prepare("SELECT * FROM role_generations WHERE role_id=? AND status='bootstrapping'").get(role.id);
     return row ? generationFromRow(row) : null;
   }
-  openRotation(project2, roleKey) {
-    const role = this.getRole(project2, roleKey);
+  openRotation(project, roleKey) {
+    const role = this.getRole(project, roleKey);
     if (!role) return null;
     const row = this.db.prepare("SELECT * FROM rotations WHERE role_id=? AND state NOT IN ('COMPLETED','FAILED') ORDER BY created_at DESC LIMIT 1").get(role.id);
     return row || null;
   }
-  bindInitial(project2, roleKey, threadId) {
-    const role = this.getRole(project2, roleKey);
+  bindInitial(project, roleKey, threadId) {
+    const role = this.getRole(project, roleKey);
     if (!role) throw new Error(`Unknown role: ${roleKey}`);
     const existingThread = this.db.prepare("SELECT * FROM role_generations WHERE thread_id=?").get(threadId);
     if (existingThread) {
       if (existingThread.role_id !== role.id) throw new Error("THREAD_ALREADY_BOUND_TO_ANOTHER_ROLE");
       return generationFromRow(existingThread);
     }
-    if (this.activeGeneration(project2, roleKey)) throw new Error("ROLE_ALREADY_HAS_ACTIVE_GENERATION");
+    if (this.activeGeneration(project, roleKey)) throw new Error("ROLE_ALREADY_HAS_ACTIVE_GENERATION");
     const time = nowIso();
     const id = newId("gen");
-    const epoch = this.projectEpoch(project2);
+    const epoch = this.projectEpoch(project);
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.db.prepare(`INSERT INTO role_generations(id,role_id,generation_number,thread_id,status,health,architecture_epoch,started_at,last_seen_at)
@@ -582,21 +408,21 @@ var RoleStore = class {
       this.db.exec("ROLLBACK");
       throw error;
     }
-    return this.activeGeneration(project2, roleKey);
+    return this.activeGeneration(project, roleKey);
   }
-  createCandidate(project2, roleKey, threadId, bootstrapHash) {
-    const role = this.getRole(project2, roleKey);
+  createCandidate(project, roleKey, threadId, bootstrapHash) {
+    const role = this.getRole(project, roleKey);
     if (!role) throw new Error(`Unknown role: ${roleKey}`);
     const max = this.db.prepare("SELECT coalesce(max(generation_number),0) n FROM role_generations WHERE role_id=?").get(role.id);
     const number = Number(max.n) + 1;
     const time = nowIso();
     const id = newId("gen");
     this.db.prepare(`INSERT INTO role_generations(id,role_id,generation_number,thread_id,status,health,architecture_epoch,bootstrap_hash,started_at,last_seen_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?)`).run(id, role.id, number, threadId, "bootstrapping", "healthy", this.projectEpoch(project2), bootstrapHash || null, time, time);
+      VALUES(?,?,?,?,?,?,?,?,?,?)`).run(id, role.id, number, threadId, "bootstrapping", "healthy", this.projectEpoch(project), bootstrapHash || null, time, time);
     return generationFromRow(this.db.prepare("SELECT * FROM role_generations WHERE id=?").get(id));
   }
-  activateCandidate(project2, roleKey, candidateId, reason) {
-    const role = this.getRole(project2, roleKey);
+  activateCandidate(project, roleKey, candidateId, reason) {
+    const role = this.getRole(project, roleKey);
     if (!role) throw new Error(`Unknown role: ${roleKey}`);
     const candidate = this.db.prepare("SELECT * FROM role_generations WHERE id=? AND role_id=?").get(candidateId, role.id);
     if (!candidate || candidate.status !== "bootstrapping") throw new Error("CANDIDATE_NOT_BOOTSTRAPPING");
@@ -613,7 +439,7 @@ var RoleStore = class {
       this.db.exec("ROLLBACK");
       throw error;
     }
-    return this.activeGeneration(project2, roleKey);
+    return this.activeGeneration(project, roleKey);
   }
   rejectCandidate(candidateId, reason) {
     this.db.prepare("UPDATE role_generations SET status='rejected',health='rejected',retirement_reason=?,ended_at=? WHERE id=? AND status='bootstrapping'").run(compactText(reason, 2e3), nowIso(), candidateId);
@@ -623,8 +449,8 @@ var RoleStore = class {
     if (!row || Number(row.generation_number) !== generationNumber) throw new Error("STALE_GENERATION");
     return generationFromRow(row);
   }
-  putFact(project2, roleKey, input) {
-    const role = this.getRole(project2, roleKey);
+  putFact(project, roleKey, input) {
+    const role = this.getRole(project, roleKey);
     if (!role) throw new Error(`Unknown role: ${roleKey}`);
     const key = slug(input.fact_key);
     const time = nowIso();
@@ -642,7 +468,7 @@ var RoleStore = class {
         compactText(input.content, 2e4),
         input.authority,
         compactText(input.source, 1e3) || null,
-        this.projectEpoch(project2),
+        this.projectEpoch(project),
         "active",
         time,
         time
@@ -654,22 +480,22 @@ var RoleStore = class {
     }
     return this.db.prepare("SELECT * FROM role_facts WHERE id=?").get(id);
   }
-  listFacts(project2, roleKey, kind) {
-    const role = this.getRole(project2, roleKey);
+  listFacts(project, roleKey, kind) {
+    const role = this.getRole(project, roleKey);
     if (!role) throw new Error(`Unknown role: ${roleKey}`);
     return kind ? this.db.prepare("SELECT * FROM role_facts WHERE role_id=? AND status='active' AND kind=? ORDER BY updated_at DESC").all(role.id, kind) : this.db.prepare("SELECT * FROM role_facts WHERE role_id=? AND status='active' ORDER BY kind,updated_at DESC").all(role.id);
   }
-  upsertTask(project2, input) {
-    this.ensureProject(project2);
+  upsertTask(project, input) {
+    this.ensureProject(project);
     const time = nowIso();
     const id = input.task_id || newId("task");
-    const role = input.owner_role ? this.getRole(project2, input.owner_role) : null;
+    const role = input.owner_role ? this.getRole(project, input.owner_role) : null;
     this.db.prepare(`INSERT INTO tasks(id,project_id,owner_role_id,title,goal,status,scope,acceptance_criteria,payload,architecture_epoch,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET owner_role_id=excluded.owner_role_id,title=excluded.title,
       goal=excluded.goal,status=excluded.status,scope=excluded.scope,acceptance_criteria=excluded.acceptance_criteria,
       payload=excluded.payload,updated_at=excluded.updated_at`).run(
       id,
-      project2.id,
+      project.id,
       role?.id || null,
       compactText(input.title, 300),
       compactText(input.goal, 5e3),
@@ -677,7 +503,7 @@ var RoleStore = class {
       compactText(input.scope, 2e3),
       JSON.stringify(uniqueStrings(input.acceptance_criteria)),
       JSON.stringify(input.payload ?? {}),
-      this.projectEpoch(project2),
+      this.projectEpoch(project),
       time,
       time
     );
@@ -686,29 +512,29 @@ var RoleStore = class {
       const insert = this.db.prepare("INSERT INTO task_dependencies(task_id,depends_on) VALUES(?,?)");
       for (const dependency of uniqueStrings(input.depends_on)) insert.run(id, dependency);
     }
-    return this.db.prepare("SELECT * FROM tasks WHERE id=? AND project_id=?").get(id, project2.id);
+    return this.db.prepare("SELECT * FROM tasks WHERE id=? AND project_id=?").get(id, project.id);
   }
-  taskGraph(project2) {
-    this.ensureProject(project2);
+  taskGraph(project) {
+    this.ensureProject(project);
     return this.db.prepare(`SELECT t.*,r.role_key owner_role,
       coalesce((SELECT json_group_array(depends_on) FROM task_dependencies d WHERE d.task_id=t.id),'[]') dependencies
-      FROM tasks t LEFT JOIN roles r ON r.id=t.owner_role_id WHERE t.project_id=? ORDER BY t.created_at`).all(project2.id);
+      FROM tasks t LEFT JOIN roles r ON r.id=t.owner_role_id WHERE t.project_id=? ORDER BY t.created_at`).all(project.id);
   }
-  sendMessage(project2, input) {
-    const from = this.getRole(project2, input.from_role);
-    const to = this.getRole(project2, input.to_role);
+  sendMessage(project, input) {
+    const from = this.getRole(project, input.from_role);
+    const to = this.getRole(project, input.to_role);
     if (!from || !to) throw new Error("UNKNOWN_MESSAGE_ROLE");
     if ((from.role_key === "liaison" || to.role_key === "liaison") && from.role_key !== "coordinator" && to.role_key !== "coordinator") {
       throw new Error("LIAISON_ROUTE_REQUIRES_COORDINATOR");
     }
     this.assertCurrent(from, input.from_generation);
-    if (input.architecture_epoch !== this.projectEpoch(project2)) throw new Error("STALE_ARCHITECTURE_EPOCH");
+    if (input.architecture_epoch !== this.projectEpoch(project)) throw new Error("STALE_ARCHITECTURE_EPOCH");
     const id = input.message_id || newId("msg");
     const time = nowIso();
     this.db.prepare(`INSERT INTO messages(id,project_id,type,from_role_id,to_role_id,from_generation,task_id,scope,architecture_epoch,payload,evidence_refs,reply_to,status,created_at)
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING`).run(
       id,
-      project2.id,
+      project.id,
       input.type,
       from.id,
       to.id,
@@ -725,8 +551,8 @@ var RoleStore = class {
     return this.db.prepare(`SELECT m.*,fr.role_key from_role,tr.role_key to_role FROM messages m
       JOIN roles fr ON fr.id=m.from_role_id JOIN roles tr ON tr.id=m.to_role_id WHERE m.id=?`).get(id);
   }
-  inbox(project2, roleKey, includeAcknowledged = false) {
-    const role = this.getRole(project2, roleKey);
+  inbox(project, roleKey, includeAcknowledged = false) {
+    const role = this.getRole(project, roleKey);
     if (!role) throw new Error(`Unknown role: ${roleKey}`);
     const statuses = includeAcknowledged ? "('pending','delivered','acknowledged')" : "('pending','delivered')";
     const rows = this.db.prepare(`SELECT m.*,fr.role_key from_role,tr.role_key to_role FROM messages m
@@ -736,26 +562,26 @@ var RoleStore = class {
     this.db.prepare("UPDATE messages SET status='delivered',delivered_at=coalesce(delivered_at,?) WHERE to_role_id=? AND status='pending'").run(time, role.id);
     return rows.map((row) => ({ ...row, payload: parseJson(row.payload, {}), evidence_refs: parseJson(row.evidence_refs, []) }));
   }
-  acknowledgeMessage(project2, roleKey, messageId) {
-    const role = this.getRole(project2, roleKey);
+  acknowledgeMessage(project, roleKey, messageId) {
+    const role = this.getRole(project, roleKey);
     if (!role) throw new Error(`Unknown role: ${roleKey}`);
     this.db.prepare("UPDATE messages SET status='acknowledged',acknowledged_at=? WHERE id=? AND to_role_id=?").run(nowIso(), messageId, role.id);
     const row = this.db.prepare("SELECT * FROM messages WHERE id=? AND to_role_id=?").get(messageId, role.id);
     if (!row) throw new Error("MESSAGE_NOT_FOUND");
     return row;
   }
-  advanceArchitecture(project2, reason) {
-    this.ensureProject(project2);
+  advanceArchitecture(project, reason) {
+    this.ensureProject(project);
     const time = nowIso();
-    this.db.prepare("UPDATE projects SET architecture_epoch=architecture_epoch+1,updated_at=? WHERE id=?").run(time, project2.id);
-    const row = this.db.prepare("SELECT * FROM projects WHERE id=?").get(project2.id);
-    this.recordEvent(project2, { event_type: "architecture_advanced", event_key: `architecture:${row.architecture_epoch}`, payload: { reason } });
+    this.db.prepare("UPDATE projects SET architecture_epoch=architecture_epoch+1,updated_at=? WHERE id=?").run(time, project.id);
+    const row = this.db.prepare("SELECT * FROM projects WHERE id=?").get(project.id);
+    this.recordEvent(project, { event_type: "architecture_advanced", event_key: `architecture:${row.architecture_epoch}`, payload: { reason } });
     return row;
   }
-  createEnvelope(project2, input) {
-    const role = this.getRole(project2, input.owner_role);
+  createEnvelope(project, input) {
+    const role = this.getRole(project, input.owner_role);
     if (!role) throw new Error(`Unknown role: ${input.owner_role}`);
-    const task = this.db.prepare("SELECT id FROM tasks WHERE id=? AND project_id=?").get(input.task_id, project2.id);
+    const task = this.db.prepare("SELECT id FROM tasks WHERE id=? AND project_id=?").get(input.task_id, project.id);
     if (!task) throw new Error("TASK_NOT_FOUND");
     const id = newId("env");
     const time = nowIso();
@@ -764,7 +590,7 @@ var RoleStore = class {
       id,
       input.task_id,
       role.id,
-      this.projectEpoch(project2),
+      this.projectEpoch(project),
       compactText(input.intent, 5e3),
       JSON.stringify(uniqueStrings(input.allowed_scope)),
       JSON.stringify(uniqueStrings(input.expected_symbols)),
@@ -776,10 +602,10 @@ var RoleStore = class {
     );
     return this.db.prepare("SELECT * FROM change_envelopes WHERE id=?").get(id);
   }
-  checkEnvelope(project2, envelopeId, actualPaths) {
-    const row = this.db.prepare(`SELECT e.* FROM change_envelopes e JOIN tasks t ON t.id=e.task_id WHERE e.id=? AND t.project_id=?`).get(envelopeId, project2.id);
+  checkEnvelope(project, envelopeId, actualPaths) {
+    const row = this.db.prepare(`SELECT e.* FROM change_envelopes e JOIN tasks t ON t.id=e.task_id WHERE e.id=? AND t.project_id=?`).get(envelopeId, project.id);
     if (!row) throw new Error("ENVELOPE_NOT_FOUND");
-    if (Number(row.architecture_epoch) !== this.projectEpoch(project2)) throw new Error("STALE_ARCHITECTURE_EPOCH");
+    if (Number(row.architecture_epoch) !== this.projectEpoch(project)) throw new Error("STALE_ARCHITECTURE_EPOCH");
     const allowed = parseJson(row.allowed_scope, []);
     const paths = uniqueStrings(actualPaths, 1e3);
     const violations = paths.filter((path) => !matchesAny(path.replace(/\\/g, "/"), allowed));
@@ -787,13 +613,13 @@ var RoleStore = class {
     this.db.prepare("UPDATE change_envelopes SET actual_paths=?,status=?,updated_at=? WHERE id=?").run(JSON.stringify(paths), status, nowIso(), envelopeId);
     return { ...this.db.prepare("SELECT * FROM change_envelopes WHERE id=?").get(envelopeId), violations };
   }
-  createRotation(project2, roleKey, reason) {
-    const role = this.getRole(project2, roleKey);
+  createRotation(project, roleKey, reason) {
+    const role = this.getRole(project, roleKey);
     if (!role) throw new Error(`Unknown role: ${roleKey}`);
-    const old = this.activeGeneration(project2, roleKey);
+    const old = this.activeGeneration(project, roleKey);
     const id = newId("rotation");
     const time = nowIso();
-    const checkpoint = this.context(project2, roleKey);
+    const checkpoint = this.context(project, roleKey);
     this.db.prepare(`INSERT INTO rotations(id,role_id,old_generation_id,state,reason,checkpoint,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?,?)`).run(id, role.id, old?.id || null, "ROTATION_PENDING", compactText(reason, 2e3), JSON.stringify(checkpoint), time, time);
     return this.db.prepare("SELECT * FROM rotations WHERE id=?").get(id);
@@ -806,8 +632,8 @@ var RoleStore = class {
     if (!row) throw new Error("ROTATION_NOT_FOUND");
     return row;
   }
-  validateBootstrap(project2, roleKey, response) {
-    const context = this.context(project2, roleKey);
+  validateBootstrap(project, roleKey, response) {
+    const context = this.context(project, roleKey);
     const role = context.role;
     const errors = [];
     if (response.role_id !== role.role_key) errors.push("role_id mismatch");
@@ -818,12 +644,12 @@ var RoleStore = class {
     if (JSON.stringify(response.critical_invariants) !== JSON.stringify(invariants)) errors.push("critical_invariants mismatch");
     return { ok: errors.length === 0, errors };
   }
-  recordEvent(project2, input) {
-    this.ensureProject(project2);
+  recordEvent(project, input) {
+    this.ensureProject(project);
     const result = this.db.prepare(`INSERT INTO events(id,project_id,role_id,generation_id,event_key,event_type,payload,created_at)
       VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(event_key) DO NOTHING`).run(
       newId("evt"),
-      project2.id,
+      project.id,
       input.role_id || null,
       input.generation_id || null,
       input.event_key || null,
@@ -833,29 +659,29 @@ var RoleStore = class {
     );
     return Number(result.changes) > 0;
   }
-  observeGeneration(project2, threadId, input) {
-    const binding = this.getGenerationByThread(project2, threadId);
+  observeGeneration(project, threadId, input) {
+    const binding = this.getGenerationByThread(project, threadId);
     if (!binding) return null;
-    const inserted = this.recordEvent(project2, { event_type: input.event, ...input.eventKey ? { event_key: input.eventKey } : {}, role_id: binding.role.id, generation_id: binding.generation.id });
-    if (!inserted) return this.getGenerationByThread(project2, threadId).generation;
+    const inserted = this.recordEvent(project, { event_type: input.event, ...input.eventKey ? { event_key: input.eventKey } : {}, role_id: binding.role.id, generation_id: binding.generation.id });
+    if (!inserted) return this.getGenerationByThread(project, threadId).generation;
     const time = nowIso();
     if (input.event === "turn") this.db.prepare("UPDATE role_generations SET turn_count=turn_count+1,last_seen_at=? WHERE id=?").run(time, binding.generation.id);
     else if (input.event === "compact") this.db.prepare(`UPDATE role_generations SET compact_count=compact_count+1,
       health=CASE WHEN compact_count+1>=2 THEN 'rotation_required' ELSE 'aging' END,last_seen_at=? WHERE id=? AND status='active'`).run(time, binding.generation.id);
     else this.db.prepare("UPDATE role_generations SET last_seen_at=? WHERE id=?").run(time, binding.generation.id);
     if (input.tokenUsage !== void 0) this.db.prepare("UPDATE role_generations SET token_usage=max(token_usage,?) WHERE id=?").run(input.tokenUsage, binding.generation.id);
-    return this.getGenerationByThread(project2, threadId).generation;
+    return this.getGenerationByThread(project, threadId).generation;
   }
-  context(project2, roleKey) {
-    const projectRow = this.ensureProject(project2);
-    const role = this.getRole(project2, roleKey);
+  context(project, roleKey) {
+    const projectRow = this.ensureProject(project);
+    const role = this.getRole(project, roleKey);
     if (!role) throw new Error(`Unknown role: ${roleKey}`);
-    const active = this.activeGeneration(project2, roleKey);
-    const facts = this.listFacts(project2, roleKey);
+    const active = this.activeGeneration(project, roleKey);
+    const facts = this.listFacts(project, roleKey);
     const tasks = this.db.prepare("SELECT * FROM tasks WHERE owner_role_id=? AND status NOT IN ('completed','cancelled') ORDER BY updated_at DESC").all(role.id);
     const messages = this.db.prepare("SELECT count(*) count FROM messages WHERE to_role_id=? AND status IN ('pending','delivered')").get(role.id);
     return {
-      project: { id: project2.id, root: project2.root, name: project2.name, constitution: projectRow.constitution, architecture_epoch: Number(projectRow.architecture_epoch) },
+      project: { id: project.id, root: project.root, name: project.name, constitution: projectRow.constitution, architecture_epoch: Number(projectRow.architecture_epoch) },
       role,
       active_generation: active,
       facts,
@@ -864,8 +690,8 @@ var RoleStore = class {
       context_hash: stableHash({ project: projectRow.constitution, epoch: projectRow.architecture_epoch, role, facts, tasks })
     };
   }
-  roleAnchor(project2, roleKey, generationOverride) {
-    const context = this.context(project2, roleKey);
+  roleAnchor(project, roleKey, generationOverride) {
+    const context = this.context(project, roleKey);
     const role = context.role;
     const generation = generationOverride ?? context.active_generation;
     const facts = context.facts;
@@ -887,20 +713,20 @@ var RoleStore = class {
       "Address other persistent roles by role:// key. Never treat this thread id as the role identity."
     ].join("\n");
   }
-  status(project2) {
-    const projectRow = this.ensureProject(project2);
+  status(project) {
+    const projectRow = this.ensureProject(project);
     const counts = this.db.prepare(`SELECT
       (SELECT count(*) FROM roles WHERE project_id=?) roles,
       (SELECT count(*) FROM role_generations g JOIN roles r ON r.id=g.role_id WHERE r.project_id=? AND g.status='active') active_generations,
       (SELECT count(*) FROM messages WHERE project_id=? AND status IN ('pending','delivered')) open_messages,
-      (SELECT count(*) FROM tasks WHERE project_id=? AND status NOT IN ('completed','cancelled')) open_tasks`).get(project2.id, project2.id, project2.id, project2.id);
+      (SELECT count(*) FROM tasks WHERE project_id=? AND status NOT IN ('completed','cancelled')) open_tasks`).get(project.id, project.id, project.id, project.id);
     const rotations = this.db.prepare(`SELECT x.*,r.role_key FROM rotations x JOIN roles r ON r.id=x.role_id
-      WHERE r.project_id=? AND x.state NOT IN ('COMPLETED','FAILED') ORDER BY x.created_at`).all(project2.id);
-    return { project: { ...project2, architecture_epoch: Number(projectRow.architecture_epoch), constitution: projectRow.constitution }, roles: this.listRoles(project2), counts, open_rotations: rotations, database_path: this.databasePath };
+      WHERE r.project_id=? AND x.state NOT IN ('COMPLETED','FAILED') ORDER BY x.created_at`).all(project.id);
+    return { project: { ...project, architecture_epoch: Number(projectRow.architecture_epoch), constitution: projectRow.constitution }, roles: this.listRoles(project), counts, open_rotations: rotations, database_path: this.databasePath };
   }
 };
 
-// src/topology.ts
+// ../codex-role-runtime/src/topology.ts
 var STANDARD_CONSTITUTION = "Preserve modular boundaries, route user communication through the Liaison, route project work through the Coordinator, route cross-domain decisions through semantic owners, and require independent verification.";
 var STANDARD_ROLES = [
   {
@@ -944,94 +770,297 @@ var STANDARD_ROLES = [
     policy: { mode: "read_only", freshVerification: true }
   }
 ];
-function initializeStandardTopology(store2, project2, constitution) {
-  const existing = store2.ensureProject(project2);
+function isRoleInitializationPrompt(prompt) {
+  if (!prompt) return false;
+  const normalized = prompt.trim().replace(/[。.!！]+$/u, "").trim().toLowerCase();
+  return normalized === "\u521D\u59CB\u5316\u89D2\u8272\u7F16\u6392" || normalized === "\u542F\u52A8\u89D2\u8272\u7F16\u6392" || normalized === "initialize role orchestration";
+}
+function initializeStandardTopology(store, project, constitution) {
+  const existing = store.ensureProject(project);
   if (constitution !== void 0 || !String(existing.constitution || "").trim()) {
-    store2.configureProject(project2, constitution ?? STANDARD_CONSTITUTION);
+    store.configureProject(project, constitution ?? STANDARD_CONSTITUTION);
   }
-  const roles = STANDARD_ROLES.map((role) => store2.defineRole(project2, role));
+  const roles = STANDARD_ROLES.map((role) => store.defineRole(project, role));
   return {
-    project: store2.configureProject(project2),
+    project: store.configureProject(project),
     entry_role: "liaison",
     coordinator_role: "coordinator",
     roles
   };
 }
 
-// src/cli.ts
-var raw = process.argv.slice(2);
-function option(name) {
-  const at = raw.indexOf(name);
-  return at >= 0 ? raw[at + 1] : void 0;
-}
-function positional() {
-  return raw.filter((value, index) => !value.startsWith("--") && (index === 0 || !raw[index - 1]?.startsWith("--")));
-}
-var args = positional();
-var command = args[0] || "status";
-var cwd = option("--cwd") || process.cwd();
-var store = new RoleStore();
-var project = resolveProject(cwd);
-function generationOptions() {
-  const model = option("--model");
-  return { ...model ? { model } : {} };
-}
-try {
-  let output;
-  switch (command) {
-    case "init":
-      output = initializeStandardTopology(store, project, option("--constitution"));
-      break;
-    case "status":
-      output = store.status(project);
-      break;
-    case "doctor": {
-      const version = spawnSync("codex", ["--version"], { encoding: "utf8", shell: process.platform === "win32" });
-      output = { ok: version.status === 0, node: process.version, codex: version.stdout.trim(), database: store.databasePath, project: project.root };
-      break;
-    }
-    case "bind":
-      output = store.bindInitial(project, args[1] || "", args[2] || "");
-      break;
-    case "context":
-      output = store.context(project, args[1] || "");
-      break;
-    case "rotate":
-      output = await rotateRoleGeneration(store, project, args[1] || "", option("--reason") || "manual rotation", generationOptions());
-      break;
-    case "start":
-      output = await startRoleGeneration(store, project, args[1] || "", generationOptions());
-      break;
-    case "open":
-    case "continue": {
-      const active = store.activeGeneration(project, args[1] || "");
-      if (!active) throw new Error("Role has no active generation.");
-      store.close();
-      const codex = resolveCodexBinary();
-      let resumed;
-      if (process.platform === "win32" && !codex.toLowerCase().endsWith(".exe")) {
-        if (!/^[A-Za-z0-9_-]+$/.test(active.thread_id)) throw new Error("Unsafe thread id in role database.");
-        const commandLine = `"${codex.replaceAll('"', "")}" resume ${active.thread_id} -C "%CODEX_ROLE_OPEN_CWD%"`;
-        resumed = spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", commandLine], {
-          stdio: "inherit",
-          shell: false,
-          env: { ...process.env, CODEX_ROLE_OPEN_CWD: project.root }
-        });
-      } else resumed = spawnSync(codex, ["resume", active.thread_id, "-C", project.root], { stdio: "inherit", shell: false });
-      process.exit(resumed.status ?? 1);
-    }
-    default:
-      throw new Error("Usage: codex-role [init|status|doctor|bind <role> <thread>|context <role>|start <role>|rotate <role> --reason <text>|open <role>] [--cwd <path>] [--model <slug>]");
+// ../codex-role-runtime/src/app-server.ts
+import { execFileSync as execFileSync2, spawn } from "node:child_process";
+import { createInterface } from "node:readline";
+function resolveCodexBinary() {
+  if (process.env.CODEX_BIN) {
+    return process.env.CODEX_BIN;
   }
-  process.stdout.write(`${JSON.stringify(output, null, 2)}
+  if (process.platform === "win32") {
+    try {
+      const candidates = execFileSync2("where.exe", ["codex.cmd"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+      if (candidates[0]) return candidates[0];
+    } catch {
+    }
+  }
+  return "codex";
+}
+var AppServerClient = class _AppServerClient {
+  child;
+  lines;
+  nextId = 1;
+  pending = /* @__PURE__ */ new Map();
+  listeners = /* @__PURE__ */ new Set();
+  stderr = [];
+  constructor(command = resolveCodexBinary()) {
+    this.child = spawn(command, ["app-server", "--stdio"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+      shell: process.platform === "win32" && !command.toLowerCase().endsWith(".exe")
+    });
+    this.lines = createInterface({ input: this.child.stdout });
+    this.lines.on("line", (line) => this.onLine(line));
+    this.child.stderr.setEncoding("utf8");
+    this.child.stderr.on("data", (chunk) => {
+      this.stderr.push(chunk);
+      if (this.stderr.length > 50) this.stderr.shift();
+    });
+    this.child.on("exit", (code) => {
+      for (const waiter of this.pending.values()) {
+        clearTimeout(waiter.timer);
+        waiter.reject(new Error(`Codex app-server exited with ${code}. ${this.stderr.join("").slice(-2e3)}`));
+      }
+      this.pending.clear();
+    });
+  }
+  static async connect() {
+    const client = new _AppServerClient();
+    await client.request("initialize", { clientInfo: { name: "codex-role-runtime", title: "Codex Role Runtime", version: "1.0.0" } });
+    client.notify("initialized", {});
+    return client;
+  }
+  onLine(line) {
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (typeof message.id === "number" && (message.result !== void 0 || message.error !== void 0)) {
+      const waiter = this.pending.get(message.id);
+      if (!waiter) return;
+      clearTimeout(waiter.timer);
+      this.pending.delete(message.id);
+      if (message.error) waiter.reject(new Error(`App Server RPC error: ${JSON.stringify(message.error)}`));
+      else waiter.resolve(message.result);
+      return;
+    }
+    for (const listener of this.listeners) listener(message);
+  }
+  request(method, params, timeoutMs = 3e4) {
+    const id = this.nextId++;
+    return new Promise((resolve2, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`App Server timeout: ${method}`));
+      }, timeoutMs);
+      this.pending.set(id, { resolve: resolve2, reject, timer });
+      this.child.stdin.write(`${JSON.stringify({ method, id, params })}
 `);
-} catch (error) {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}
+    });
+  }
+  notify(method, params) {
+    this.child.stdin.write(`${JSON.stringify({ method, params })}
 `);
-  process.exitCode = 1;
-} finally {
+  }
+  async startThread(input) {
+    const params = {
+      cwd: input.cwd,
+      approvalPolicy: "never",
+      sandbox: input.policy.mode === "read_only" ? "read-only" : "workspace-write",
+      serviceName: "codex-role-runtime"
+    };
+    if (input.model) params.model = input.model;
+    const result = await this.request("thread/start", params, 6e4);
+    const threadId = result?.thread?.id;
+    if (!threadId) throw new Error(`thread/start returned no thread id: ${JSON.stringify(result)}`);
+    await this.request("thread/name/set", { threadId, name: input.name }).catch(() => void 0);
+    return threadId;
+  }
+  async resumeThread(threadId) {
+    const result = await this.request("thread/resume", { threadId }, 6e4);
+    if (result?.thread?.id !== threadId) throw new Error(`thread/resume returned the wrong thread: ${JSON.stringify(result)}`);
+  }
+  async runTurn(threadId, prompt, timeoutMs = 9e5) {
+    await this.resumeThread(threadId);
+    let lastText = "";
+    const completed = new Promise((resolve2, reject) => {
+      const timer = setTimeout(() => {
+        this.listeners.delete(listener);
+        reject(new Error("Role dispatch turn timed out."));
+      }, timeoutMs);
+      const listener = (message) => {
+        const params = message.params || {};
+        if (params.threadId && params.threadId !== threadId) return;
+        if (message.method === "item/agentMessage/delta") lastText += params.delta || "";
+        if (message.method === "item/completed" && params.item?.type === "agentMessage") lastText = params.item.text || lastText;
+        if (message.method === "turn/completed") {
+          clearTimeout(timer);
+          this.listeners.delete(listener);
+          if (params.turn?.status && !["completed", "Completed"].includes(params.turn.status)) reject(new Error(`Role dispatch turn ${params.turn.status}`));
+          else resolve2();
+        }
+      };
+      this.listeners.add(listener);
+    });
+    await this.request("turn/start", { threadId, input: [{ type: "text", text: prompt }] }, 6e4);
+    await completed;
+    return lastText.trim();
+  }
+  close() {
+    this.lines.close();
+    this.child.stdin.end();
+    this.child.kill();
+  }
+};
+
+// ../codex-role-runtime/src/generation-service.ts
+function expectedBootstrap(store, project, role) {
+  const context = store.context(project, role.role_key);
+  const facts = context.facts;
+  return {
+    role_id: role.role_key,
+    mission: role.mission,
+    owned_domains: role.owned_domains,
+    critical_invariants: facts.filter((fact) => fact.kind === "invariant").map((fact) => String(fact.content)),
+    open_questions: facts.filter((fact) => fact.kind === "open_question").map((fact) => String(fact.content)),
+    architecture_epoch: Number(context.project.architecture_epoch)
+  };
+}
+async function rotateRoleGeneration(store, project, roleKey, reason, options = {}) {
+  const role = store.getRole(project, roleKey);
+  if (!role) throw new Error(`Unknown role: ${roleKey}`);
+  const rotation = store.createRotation(project, roleKey, reason);
+  let client = null;
+  let candidate = null;
   try {
-    store.close();
-  } catch {
+    client = options.clientFactory ? await options.clientFactory() : await AppServerClient.connect();
+    store.updateRotation(String(rotation.id), "DRAINING");
+    store.updateRotation(String(rotation.id), "CHECKPOINTING");
+    store.updateRotation(String(rotation.id), "VALIDATING");
+    const threadId = await client.startThread({ cwd: project.root, ...options.model ? { model: options.model } : {}, policy: role.policy, name: `${role.name} \xB7 Generation` });
+    const expected = expectedBootstrap(store, project, role);
+    candidate = store.createCandidate(project, roleKey, threadId, JSON.stringify(expected));
+    store.updateRotation(String(rotation.id), "BOOTSTRAPPING", { candidateId: candidate.id });
+    const validation = store.validateBootstrap(project, roleKey, expected);
+    if (!validation.ok) {
+      store.rejectCandidate(candidate.id, validation.errors.join("; "));
+      store.updateRotation(String(rotation.id), "FAILED", { error: validation.errors.join("; ") });
+      throw new Error(`Bootstrap rejected: ${validation.errors.join("; ")}`);
+    }
+    store.updateRotation(String(rotation.id), "CUTOVER");
+    const active = store.activateCandidate(project, roleKey, candidate.id, reason);
+    store.updateRotation(String(rotation.id), "COMPLETED");
+    return { rotation_id: rotation.id, role: roleKey, generation: active, validation };
+  } catch (error) {
+    if (candidate) {
+      try {
+        store.rejectCandidate(candidate.id, `Bootstrap failed: ${error instanceof Error ? error.message : String(error)}`);
+      } catch {
+      }
+    }
+    try {
+      store.updateRotation(String(rotation.id), "FAILED", { error: error instanceof Error ? error.message : String(error) });
+    } catch {
+    }
+    throw error;
+  } finally {
+    client?.close();
   }
 }
+async function startRoleGeneration(store, project, roleKey, options = {}) {
+  const active = store.activeGeneration(project, roleKey);
+  if (active) return { role: roleKey, status: "active", started: false, generation: active };
+  const candidate = store.bootstrappingGeneration(project, roleKey);
+  const rotation = store.openRotation(project, roleKey);
+  if (candidate && rotation) return { role: roleKey, status: "bootstrapping", started: false, generation: candidate, rotation_id: rotation.id };
+  if (candidate) store.rejectCandidate(candidate.id, "Recovered orphaned bootstrap candidate before retrying role_start.");
+  if (rotation) return { role: roleKey, status: "starting", started: false, rotation_id: rotation.id };
+  const result = await rotateRoleGeneration(store, project, roleKey, "initial generation", options);
+  return { ...result, status: "active", started: true };
+}
+async function dispatchLiaisonRequest(store, project, input) {
+  const liaison = store.getRole(project, "liaison");
+  const coordinator = store.getRole(project, "coordinator");
+  if (!liaison || !coordinator) throw new Error("STANDARD_TOPOLOGY_NOT_INITIALIZED");
+  store.assertCurrent(liaison, input.liaison_generation);
+  const coordinatorGeneration = store.activeGeneration(project, "coordinator");
+  if (!coordinatorGeneration) throw new Error("COORDINATOR_NOT_ACTIVE: call role_start for role://coordinator first");
+  const architectureEpoch = store.projectEpoch(project);
+  const requestInput = {
+    ...input.message_id ? { message_id: input.message_id } : {},
+    type: "ASSIGN",
+    from_role: "liaison",
+    to_role: "coordinator",
+    from_generation: input.liaison_generation,
+    ...input.task_id ? { task_id: input.task_id } : {},
+    scope: input.scope || "",
+    architecture_epoch: architectureEpoch,
+    payload: { user_request: input.request }
+  };
+  const requestMessage = store.sendMessage(project, requestInput);
+  store.inbox(project, "coordinator");
+  const client = await AppServerClient.connect();
+  try {
+    const responseText = await client.runTurn(coordinatorGeneration.thread_id, [
+      store.roleAnchor(project, "coordinator"),
+      "A request arrived from role://liaison. Coordinate the internal work needed to answer it. Use durable tasks and typed role messages when useful.",
+      "Return a concise response for role://liaison containing questions, progress, blockers, decisions needed, or verified results. Do not address the user directly.",
+      `Request message: ${JSON.stringify({ id: requestMessage.id, task_id: requestMessage.task_id, scope: requestMessage.scope, payload: { user_request: input.request } })}`
+    ].join("\n\n"));
+    const resultMessage = store.sendMessage(project, {
+      type: "RESULT",
+      from_role: "coordinator",
+      to_role: "liaison",
+      from_generation: coordinatorGeneration.generation_number,
+      ...input.task_id ? { task_id: input.task_id } : {},
+      scope: input.scope || "",
+      architecture_epoch: store.projectEpoch(project),
+      payload: { response: responseText },
+      reply_to: String(requestMessage.id)
+    });
+    store.acknowledgeMessage(project, "coordinator", String(requestMessage.id));
+    return { request_message: requestMessage, result_message: resultMessage, response: responseText };
+  } finally {
+    client.close();
+  }
+}
+export {
+  AppServerClient,
+  FACT_KINDS,
+  GENERATION_STATUSES,
+  MESSAGE_TYPES,
+  ROLE_KINDS,
+  RoleStore,
+  STANDARD_CONSTITUTION,
+  STANDARD_ROLES,
+  compactText,
+  dispatchLiaisonRequest,
+  expectedBootstrap,
+  initializeStandardTopology,
+  isRoleInitializationPrompt,
+  matchesAny,
+  newId,
+  nowIso,
+  parseJson,
+  redact,
+  resolveCodexBinary,
+  resolveProject,
+  rotateRoleGeneration,
+  slug,
+  stableHash,
+  stableId,
+  stableJson,
+  startRoleGeneration,
+  uniqueStrings
+};

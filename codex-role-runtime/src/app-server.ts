@@ -1,6 +1,6 @@
 import { execFileSync, spawn, ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface, Interface } from "node:readline";
-import { BootstrapResponse, RolePolicy } from "./types.js";
+import { RolePolicy } from "./types.js";
 
 type Rpc = { id?: number | string; method?: string; params?: any; result?: any; error?: any };
 
@@ -83,53 +83,9 @@ export class AppServerClient {
     return threadId;
   }
 
-  async setGoal(threadId: string, objective: string): Promise<void> {
-    await this.request("thread/goal/set", { threadId, objective: objective.slice(0, 4000), status: "active" });
-  }
-
   async resumeThread(threadId: string): Promise<void> {
     const result = await this.request("thread/resume", { threadId }, 60_000);
     if (result?.thread?.id !== threadId) throw new Error(`thread/resume returned the wrong thread: ${JSON.stringify(result)}`);
-  }
-
-  async bootstrapHealth(threadId: string, expected: BootstrapResponse, contextText: string): Promise<BootstrapResponse> {
-    const outputSchema = {
-      type: "object", additionalProperties: false,
-      properties: {
-        role_id: { type: "string" }, mission: { type: "string" }, owned_domains: { type: "array", items: { type: "string" } },
-        critical_invariants: { type: "array", items: { type: "string" } }, open_questions: { type: "array", items: { type: "string" } },
-        architecture_epoch: { type: "integer" }
-      },
-      required: ["role_id", "mission", "owned_domains", "critical_invariants", "open_questions", "architecture_epoch"]
-    };
-    let lastText = "";
-    const completed = new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => { this.listeners.delete(listener); reject(new Error("Bootstrap health turn timed out.")); }, 180_000);
-      const listener = (message: Rpc) => {
-        const params = message.params || {};
-        if (params.threadId && params.threadId !== threadId) return;
-        if (message.method === "item/agentMessage/delta") lastText += params.delta || "";
-        if (message.method === "item/completed" && params.item?.type === "agentMessage") lastText = params.item.text || lastText;
-        if (message.method === "turn/completed") {
-          clearTimeout(timer); this.listeners.delete(listener);
-          if (params.turn?.status && !["completed", "Completed"].includes(params.turn.status)) reject(new Error(`Bootstrap turn ${params.turn.status}`));
-          else resolve();
-        }
-      };
-      this.listeners.add(listener);
-    });
-    const prompt = [
-      "You are bootstrapping a persistent Codex role generation. Do not use tools and do not perform project work.",
-      "Return only the requested JSON, reproducing the authoritative values exactly.", contextText,
-      `Expected values: ${JSON.stringify(expected)}`
-    ].join("\n\n");
-    await this.request("turn/start", { threadId, input: [{ type: "text", text: prompt }], outputSchema }, 60_000);
-    await completed;
-    try { return JSON.parse(lastText) as BootstrapResponse; }
-    catch {
-      const match = lastText.match(/\{[\s\S]*\}/); if (!match) throw new Error(`Bootstrap returned no JSON: ${lastText.slice(-2000)}`);
-      return JSON.parse(match[0]) as BootstrapResponse;
-    }
   }
 
   async runTurn(threadId: string, prompt: string, timeoutMs = 900_000): Promise<string> {

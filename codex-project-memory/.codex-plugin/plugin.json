@@ -1,7 +1,7 @@
 {
   "name": "codex-project-memory",
-  "version": "1.0.0+codex.20260816172349",
-  "description": "Durable, provenance-aware project memory for long-running Codex development tasks.",
+  "version": "1.0.0+codex.20260816191639",
+  "description": "Integrated project memory and persistent role orchestration for long-running Codex development.",
   "author": {
     "name": "Local developer"
   },
@@ -17,9 +17,9 @@
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
-    "displayName": "Codex Project Memory",
-    "shortDescription": "Durable memory for long Codex projects",
-    "longDescription": "Keeps compact task state, decisions, failures, verification evidence, and searchable project history across compaction and resumed sessions.",
+    "displayName": "Codex Project Runtime",
+    "shortDescription": "Memory and persistent role orchestration",
+    "longDescription": "Combines durable project memory with a user Liaison, internal Coordinator, typed role routing, verification evidence, and replaceable role task generations.",
     "developerName": "Local developer",
     "category": "Developer Tools",
     "capabilities": [
@@ -28,6 +28,7 @@
     ],
     "defaultPrompt": [
       "Show the active project-memory task and its open loops.",
+      "\u521d\u59cb\u5316\u89d2\u8272\u7f16\u6392",
       "Search project memory for the last failed approach.",
       "Checkpoint this task before I switch projects."
     ],

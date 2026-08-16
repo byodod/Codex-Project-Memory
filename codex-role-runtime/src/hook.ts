@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { startRoleGeneration } from "./generation-service.js";
 import { resolveProject } from "./project.js";
 import { RoleStore } from "./store.js";
 import { initializeStandardTopology, isRoleInitializationPrompt } from "./topology.js";
@@ -41,7 +42,11 @@ try {
         process.exit(0);
       }
       const generation = store.bindInitial(project, "liaison", input.session_id);
-      process.stdout.write(JSON.stringify(context(input.hook_event_name, `Role orchestration initialized. This task is the user's communication entry point.\n${store.roleAnchor(project, "liaison")}\nSend structured user intent to role://coordinator; relay its questions, progress, blockers, and verified results back to the user.`)));
+      const testCoordinatorThread = process.env.CODEX_ROLE_RUNTIME_TEST_COORDINATOR_THREAD;
+      const coordinator = await startRoleGeneration(store, project, "coordinator", testCoordinatorThread ? {
+        clientFactory: async () => ({ async startThread() { return testCoordinatorThread; }, close() {} })
+      } : {});
+      process.stdout.write(JSON.stringify(context(input.hook_event_name, `Role orchestration initialized. This task is the user's communication entry point; role://coordinator status is ${(coordinator as Record<string, unknown>).status}.\n${store.roleAnchor(project, "liaison")}\nSend structured user intent to role://coordinator; relay its questions, progress, blockers, and verified results back to the user.`)));
       process.exit(0);
     }
     const claim = input.prompt?.match(/^\s*role:\/\/bind\s+([a-z0-9-]+)\s*$/i);
@@ -60,12 +65,14 @@ try {
   }
 
   const { role, generation } = binding;
-  const stale = generation.status !== "active";
+  const bootstrapping = generation.status === "bootstrapping";
+  const stale = generation.status === "retired" || generation.status === "rejected";
   const eventKey = `${input.session_id}:${input.turn_id || input.tool_use_id || input.trigger || input.source || input.hook_event_name}:${input.hook_event_name}`;
 
   switch (input.hook_event_name) {
     case "SessionStart":
       if (stale) process.stdout.write(JSON.stringify({ continue: false, stopReason: `STALE_GENERATION: role://${role.role_key} now uses another thread.` }));
+      else if (bootstrapping) process.stdout.write(JSON.stringify(context("SessionStart", `This task is a bootstrap candidate and is not active yet. Do not perform project work until deterministic cutover completes.\n${store.roleAnchor(project, role.role_key, generation)}`)));
       else {
         store.observeGeneration(project, input.session_id, { event: "session_start", eventKey });
         process.stdout.write(JSON.stringify(context("SessionStart", store.roleAnchor(project, role.role_key))));
@@ -73,6 +80,7 @@ try {
       break;
     case "UserPromptSubmit":
       if (stale) process.stdout.write(JSON.stringify(deny("UserPromptSubmit", `STALE_GENERATION: this thread is retired for role://${role.role_key}. Open its current generation.`)));
+      else if (bootstrapping) process.stdout.write(JSON.stringify(deny("UserPromptSubmit", `BOOTSTRAPPING_GENERATION: role://${role.role_key} candidate ${generation.generation_number} is awaiting deterministic cutover.`)));
       else {
         store.observeGeneration(project, input.session_id, { event: "turn", eventKey });
         process.stdout.write(JSON.stringify(context("UserPromptSubmit", store.roleAnchor(project, role.role_key))));
@@ -80,6 +88,7 @@ try {
       break;
     case "PreToolUse": {
       if (stale) { process.stdout.write(JSON.stringify(deny("PreToolUse", `STALE_GENERATION: retired generation ${generation.generation_number} cannot use tools.`))); break; }
+      if (bootstrapping) { process.stdout.write(JSON.stringify(deny("PreToolUse", `BOOTSTRAPPING_GENERATION: candidate ${generation.generation_number} cannot use tools before deterministic cutover.`))); break; }
       const tool = input.tool_name || "";
       if (matchesAny(tool, role.policy.deniedTools) || (role.policy.mode === "read_only" && tool === "Bash" && isMutatingShell(input.tool_input))) {
         process.stdout.write(JSON.stringify(deny("PreToolUse", `Role policy denies ${tool} for role://${role.role_key} (${role.policy.mode}). Delegate implementation to a writable worker.`)));

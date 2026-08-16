@@ -7,6 +7,10 @@ description: Keep exact, durable project and task state across long Codex develo
 
 Use the `project_memory` MCP tools to preserve the smallest useful state for long engineering work. Always pass the current repository working directory as `cwd`; this keeps multiple Codex projects isolated even when one MCP process serves several tasks.
 
+Codex host-level memories are a separate source and may describe another repository. They never substitute for `task_get` and `memory_search` in this plugin. For project work, query this plugin's repository-scoped database first, then reconcile any host memory as secondary historical context.
+
+This plugin also bundles `role_runtime`. When persistent roles are active, Project Memory is the durable user-level goal and completion contract, while Role Runtime owns internal routing, mailboxes, semantic ownership, and generation lifecycle. Keep them synchronized; do not ask the user to operate two separate plugins.
+
 ## Start or resume
 
 1. Call `task_get` before substantive work.

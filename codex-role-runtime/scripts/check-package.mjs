@@ -15,5 +15,7 @@ if (manifest.name !== "codex-role-runtime" || manifest.mcpServers !== "./.mcp.js
 if (!mcp.mcpServers?.role_runtime?.args?.some((value) => value.includes("process.env.PLUGIN_ROOT"))) throw new Error("MCP entry must resolve from PLUGIN_ROOT.");
 for (const event of ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact", "PostCompact", "Stop", "SessionEnd"])
   if (!hooks.hooks[event]?.length) throw new Error(`Missing ${event} hook.`);
+for (const registrations of Object.values(hooks.hooks)) for (const registration of registrations)
+  for (const hook of registration.hooks || []) if (!hook.command?.includes("process.env.PLUGIN_ROOT")) throw new Error("Hook command must resolve from the PLUGIN_ROOT environment without shell interpolation.");
 const files = await Promise.all(required.map(async (relative) => [relative, (await stat(resolve(root, relative))).size]));
 process.stdout.write(`${JSON.stringify({ ok: true, version: manifest.version, files: Object.fromEntries(files) }, null, 2)}\n`);

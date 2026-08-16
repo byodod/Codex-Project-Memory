@@ -72,7 +72,8 @@ function markdownEscape(value) {
 
 // src/storage.ts
 function dataRoot(explicit) {
-  return explicit || process.env.PLUGIN_DATA || process.env.CODEX_PROJECT_MEMORY_HOME || join(homedir(), ".codex-project-memory");
+  const codexHome = process.env.CODEX_HOME || join(homedir(), ".codex");
+  return explicit || process.env.CODEX_PROJECT_MEMORY_HOME || process.env.PLUGIN_DATA || join(codexHome, "plugin-data", "codex-project-memory");
 }
 function taskFromRow(row) {
   if (!row) return null;
@@ -95,7 +96,8 @@ function memoryFromRow(row) {
     importance: Number(row.importance),
     recall_count: Number(row.recall_count),
     tags: safeJsonParse(row.tags, []),
-    score: row.score === void 0 ? void 0 : Number(row.score)
+    score: row.score === void 0 ? void 0 : Number(row.score),
+    rank: row.rank === void 0 ? void 0 : Number(row.rank)
   };
 }
 var MemoryStore = class {
@@ -447,12 +449,14 @@ var MemoryStore = class {
       if (options.taskId && memory.task_id === options.taskId) score += 2;
       if (["user_decision", "project_authority"].includes(memory.authority)) score += 1.5;
       if (memory.kind === "failure") score += 0.5;
+      if (memory.rank !== void 0 && memory.rank < 0) score += Math.min(8, -memory.rank);
       return { ...memory, score };
     }).sort((a, b) => (b.score ?? 0) - (a.score ?? 0)).slice(0, limit);
     if (scored.length) {
       const timestamp = nowIso();
       const update = this.db.prepare("UPDATE memories SET recall_count=recall_count+1,last_recalled_at=? WHERE id=?");
       for (const memory of scored) update.run(timestamp, memory.id);
+      return scored.map((memory) => ({ ...memory, recall_count: memory.recall_count + 1, last_recalled_at: timestamp }));
     }
     return scored;
   }

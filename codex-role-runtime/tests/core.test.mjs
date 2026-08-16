@@ -4,7 +4,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { initializeStandardTopology, RoleStore, resolveProject } from "../dist/library.mjs";
+import { initializeStandardTopology, RoleStore, resolveProject, rotateRoleGeneration, startRoleGeneration } from "../dist/library.mjs";
 
 function fixture() {
   const cwd = mkdtempSync(join(tmpdir(), "codex-role-project-"));
@@ -82,6 +82,61 @@ test("candidate remains non-active until validated atomic cutover and old writes
     assert.equal(reopened.getGenerationByThread(project, "thr-old").generation.status, "retired");
     assert.throws(() => reopened.assertCurrent(reopened.getRole(project, "architect"), old.generation_number), /STALE_GENERATION/);
   } finally { reopened.close(); }
+});
+
+test("role_start activates deterministically and repeated calls are idempotent", async () => {
+  const { store, project } = fixture();
+  const calls = [];
+  const client = {
+    async startThread(input) { calls.push(input); return "thr-started"; },
+    close() { calls.push("closed"); }
+  };
+  try {
+    const started = await startRoleGeneration(store, project, "architect", { clientFactory: async () => client });
+    assert.equal(started.status, "active");
+    assert.equal(started.started, true);
+    assert.equal(started.generation.thread_id, "thr-started");
+    assert.equal(calls.filter((value) => typeof value === "object").length, 1);
+
+    const repeated = await startRoleGeneration(store, project, "architect", { clientFactory: async () => { throw new Error("must not start another thread"); } });
+    assert.equal(repeated.status, "active");
+    assert.equal(repeated.started, false);
+    assert.equal(repeated.generation.id, started.generation.id);
+    assert.equal(store.db.prepare("SELECT count(*) n FROM role_generations WHERE role_id=?").get(store.getRole(project, "architect").id).n, 1);
+  } finally { store.close(); }
+});
+
+test("failed startup rejects its candidate and a retry can create the next generation", async () => {
+  const { store, project } = fixture();
+  const originalActivate = store.activateCandidate.bind(store);
+  store.activateCandidate = () => { throw new Error("CUTOVER_FAILED_FOR_TEST"); };
+  try {
+    await assert.rejects(
+      rotateRoleGeneration(store, project, "architect", "initial generation", { clientFactory: async () => ({ async startThread() { return "thr-failed"; }, close() {} }) }),
+      /CUTOVER_FAILED_FOR_TEST/
+    );
+    assert.equal(store.bootstrappingGeneration(project, "architect"), null);
+    assert.equal(store.db.prepare("SELECT status FROM role_generations WHERE thread_id='thr-failed'").get().status, "rejected");
+    assert.equal(store.db.prepare("SELECT state FROM rotations ORDER BY created_at DESC LIMIT 1").get().state, "FAILED");
+
+    store.activateCandidate = originalActivate;
+    const retried = await startRoleGeneration(store, project, "architect", { clientFactory: async () => ({ async startThread() { return "thr-retry"; }, close() {} }) });
+    assert.equal(retried.generation.generation_number, 2);
+    assert.equal(retried.generation.thread_id, "thr-retry");
+  } finally { store.close(); }
+});
+
+test("role_start returns an existing in-progress candidate without duplicating it", async () => {
+  const { store, project } = fixture();
+  try {
+    const rotation = store.createRotation(project, "architect", "initial generation");
+    const candidate = store.createCandidate(project, "architect", "thr-in-progress");
+    store.updateRotation(rotation.id, "BOOTSTRAPPING", { candidateId: candidate.id });
+    const result = await startRoleGeneration(store, project, "architect", { clientFactory: async () => { throw new Error("must not create a duplicate"); } });
+    assert.equal(result.status, "bootstrapping");
+    assert.equal(result.generation.id, candidate.id);
+    assert.equal(store.db.prepare("SELECT count(*) n FROM role_generations WHERE role_id=?").get(store.getRole(project, "architect").id).n, 1);
+  } finally { store.close(); }
 });
 
 test("typed messages are idempotent and reject stale generation or architecture", () => {

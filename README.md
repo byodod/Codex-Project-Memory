@@ -1,11 +1,11 @@
 # Codex Runtime Tools
 
-这个仓库包含两款互补的 Codex 原生插件：
+这个仓库开发两套互补的运行时组件，但对用户发布为一款统一的 Codex 插件：
 
-- [Codex Project Memory](./codex-project-memory/README.md)：保存跨压缩、恢复和交接的项目任务记忆、工程事实与验证证据。
-- [Codex Role Runtime](./codex-role-runtime/README.md)：用一句“初始化角色编排”建立用户联络者与内部协调者，让持久角色独立于可替换会话，并提供 typed mailbox、任务图、权限策略和安全换代。
+- [Codex Project Runtime](./codex-project-memory/README.md)：最终安装包，整合项目记忆、用户联络者、内部协调者、角色任务图、权限策略和安全换代。
+- [Role Runtime 源组件](./codex-role-runtime/README.md)：保留独立源码与测试，构建时自动打包进上面的统一插件，不再要求用户单独安装。
 
-## Project Memory
+## 统一安装
 
 它用本地 SQLite FTS5、Codex 生命周期 Hooks 和 MCP 工具保存可恢复的任务状态、带来源的工程记忆、工具事实与验证证据；不需要 API Key，也不会把完整历史常驻到模型上下文。
 
@@ -20,16 +20,7 @@ npm test
 
 安装完成后重启 Codex，在新任务中通过 `/hooks` 信任插件 Hooks。
 
-## Role Runtime
-
-```powershell
-cd .\codex-role-runtime
-npm ci
-npm test
-.\scripts\install.ps1
-```
-
-Role Runtime 把 `Project / Role / Responsibility / State` 作为长期实体，把 Codex Thread 作为可退休、可替换的 Generation。它通过 SQLite 硬约束、MCP、Hooks 和 Codex App Server 实现角色路由、旧代拒绝、压缩健康和原子换代。
+安装脚本会同时打包 Role Runtime，移除重复的独立角色插件安装，并保留已有角色数据库。Project Memory 保存用户级目标、决策、失败与验证证据；Role Runtime 保存内部角色身份、路由、任务图与 Generation 生命周期。
 
 安装并重启 Codex 后，在项目的新任务中只需发送 `初始化角色编排`。当前任务会成为用户联络者，内部协调者由插件启动；之后用户始终通过这个联络者沟通。
 
@@ -42,7 +33,7 @@ Role Runtime 把 `Project / Role / Responsibility / State` 作为长期实体，
 
 ## 许可证
 
-两个插件均采用 MIT License 发布：
+统一插件及其 Role Runtime 源组件均采用 MIT License 发布：
 
 - [Codex Project Memory License](./codex-project-memory/LICENSE)
 - [Codex Role Runtime License](./codex-role-runtime/LICENSE)

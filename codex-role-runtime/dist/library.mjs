@@ -149,7 +149,7 @@ var RoleStore = class {
   db;
   constructor(root) {
     const codexHome = process.env.CODEX_HOME || join(homedir(), ".codex");
-    this.root = root || process.env.PLUGIN_DATA || process.env.CODEX_ROLE_RUNTIME_HOME || join(codexHome, "plugin-data", "codex-role-runtime");
+    this.root = root || process.env.CODEX_ROLE_RUNTIME_HOME || process.env.PLUGIN_DATA || join(codexHome, "plugin-data", "codex-role-runtime");
     mkdirSync(this.root, { recursive: true });
     this.databasePath = join(this.root, "role-runtime.sqlite3");
     this.db = new DatabaseSync(this.databasePath);
@@ -374,6 +374,18 @@ var RoleStore = class {
     const row = this.db.prepare("SELECT * FROM role_generations WHERE role_id=? AND status='active'").get(role.id);
     return row ? generationFromRow(row) : null;
   }
+  bootstrappingGeneration(project, roleKey) {
+    const role = this.getRole(project, roleKey);
+    if (!role) return null;
+    const row = this.db.prepare("SELECT * FROM role_generations WHERE role_id=? AND status='bootstrapping'").get(role.id);
+    return row ? generationFromRow(row) : null;
+  }
+  openRotation(project, roleKey) {
+    const role = this.getRole(project, roleKey);
+    if (!role) return null;
+    const row = this.db.prepare("SELECT * FROM rotations WHERE role_id=? AND state NOT IN ('COMPLETED','FAILED') ORDER BY created_at DESC LIMIT 1").get(role.id);
+    return row || null;
+  }
   bindInitial(project, roleKey, threadId) {
     const role = this.getRole(project, roleKey);
     if (!role) throw new Error(`Unknown role: ${roleKey}`);
@@ -401,14 +413,12 @@ var RoleStore = class {
   createCandidate(project, roleKey, threadId, bootstrapHash) {
     const role = this.getRole(project, roleKey);
     if (!role) throw new Error(`Unknown role: ${roleKey}`);
-    const current = this.activeGeneration(project, roleKey);
     const max = this.db.prepare("SELECT coalesce(max(generation_number),0) n FROM role_generations WHERE role_id=?").get(role.id);
     const number = Number(max.n) + 1;
     const time = nowIso();
     const id = newId("gen");
     this.db.prepare(`INSERT INTO role_generations(id,role_id,generation_number,thread_id,status,health,architecture_epoch,bootstrap_hash,started_at,last_seen_at)
       VALUES(?,?,?,?,?,?,?,?,?,?)`).run(id, role.id, number, threadId, "bootstrapping", "healthy", this.projectEpoch(project), bootstrapHash || null, time, time);
-    if (!current && number !== 1) throw new Error("INVALID_INITIAL_GENERATION");
     return generationFromRow(this.db.prepare("SELECT * FROM role_generations WHERE id=?").get(id));
   }
   activateCandidate(project, roleKey, candidateId, reason) {
@@ -680,10 +690,10 @@ var RoleStore = class {
       context_hash: stableHash({ project: projectRow.constitution, epoch: projectRow.architecture_epoch, role, facts, tasks })
     };
   }
-  roleAnchor(project, roleKey) {
+  roleAnchor(project, roleKey, generationOverride) {
     const context = this.context(project, roleKey);
     const role = context.role;
-    const generation = context.active_generation;
+    const generation = generationOverride ?? context.active_generation;
     const facts = context.facts;
     const invariants = facts.filter((fact) => fact.kind === "invariant").slice(0, 8);
     const tasks = context.tasks;
@@ -691,7 +701,7 @@ var RoleStore = class {
     return [
       "[Codex Role Runtime]",
       `Role: ${role.name} (role://${role.role_key})`,
-      `Generation: ${generation?.generation_number ?? "unbound"}; Architecture epoch: ${context.project.architecture_epoch}`,
+      `Generation: ${generation?.generation_number ?? "unbound"}${generation ? ` (${generation.status})` : ""}; Architecture epoch: ${context.project.architecture_epoch}`,
       `Mission: ${role.mission}`,
       `Owns: ${role.owned_domains.join(", ") || "none declared"}`,
       `Does not own: ${role.excluded_domains.join(", ") || "none declared"}`,
@@ -877,62 +887,9 @@ var AppServerClient = class _AppServerClient {
     await this.request("thread/name/set", { threadId, name: input.name }).catch(() => void 0);
     return threadId;
   }
-  async setGoal(threadId, objective) {
-    await this.request("thread/goal/set", { threadId, objective: objective.slice(0, 4e3), status: "active" });
-  }
   async resumeThread(threadId) {
     const result = await this.request("thread/resume", { threadId }, 6e4);
     if (result?.thread?.id !== threadId) throw new Error(`thread/resume returned the wrong thread: ${JSON.stringify(result)}`);
-  }
-  async bootstrapHealth(threadId, expected, contextText) {
-    const outputSchema = {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        role_id: { type: "string" },
-        mission: { type: "string" },
-        owned_domains: { type: "array", items: { type: "string" } },
-        critical_invariants: { type: "array", items: { type: "string" } },
-        open_questions: { type: "array", items: { type: "string" } },
-        architecture_epoch: { type: "integer" }
-      },
-      required: ["role_id", "mission", "owned_domains", "critical_invariants", "open_questions", "architecture_epoch"]
-    };
-    let lastText = "";
-    const completed = new Promise((resolve2, reject) => {
-      const timer = setTimeout(() => {
-        this.listeners.delete(listener);
-        reject(new Error("Bootstrap health turn timed out."));
-      }, 18e4);
-      const listener = (message) => {
-        const params = message.params || {};
-        if (params.threadId && params.threadId !== threadId) return;
-        if (message.method === "item/agentMessage/delta") lastText += params.delta || "";
-        if (message.method === "item/completed" && params.item?.type === "agentMessage") lastText = params.item.text || lastText;
-        if (message.method === "turn/completed") {
-          clearTimeout(timer);
-          this.listeners.delete(listener);
-          if (params.turn?.status && !["completed", "Completed"].includes(params.turn.status)) reject(new Error(`Bootstrap turn ${params.turn.status}`));
-          else resolve2();
-        }
-      };
-      this.listeners.add(listener);
-    });
-    const prompt = [
-      "You are bootstrapping a persistent Codex role generation. Do not use tools and do not perform project work.",
-      "Return only the requested JSON, reproducing the authoritative values exactly.",
-      contextText,
-      `Expected values: ${JSON.stringify(expected)}`
-    ].join("\n\n");
-    await this.request("turn/start", { threadId, input: [{ type: "text", text: prompt }], outputSchema }, 6e4);
-    await completed;
-    try {
-      return JSON.parse(lastText);
-    } catch {
-      const match = lastText.match(/\{[\s\S]*\}/);
-      if (!match) throw new Error(`Bootstrap returned no JSON: ${lastText.slice(-2e3)}`);
-      return JSON.parse(match[0]);
-    }
   }
   async runTurn(threadId, prompt, timeoutMs = 9e5) {
     await this.resumeThread(threadId);
@@ -984,18 +941,18 @@ async function rotateRoleGeneration(store, project, roleKey, reason, options = {
   const role = store.getRole(project, roleKey);
   if (!role) throw new Error(`Unknown role: ${roleKey}`);
   const rotation = store.createRotation(project, roleKey, reason);
-  const client = await AppServerClient.connect();
+  let client = null;
+  let candidate = null;
   try {
+    client = options.clientFactory ? await options.clientFactory() : await AppServerClient.connect();
     store.updateRotation(String(rotation.id), "DRAINING");
     store.updateRotation(String(rotation.id), "CHECKPOINTING");
     store.updateRotation(String(rotation.id), "VALIDATING");
     const threadId = await client.startThread({ cwd: project.root, ...options.model ? { model: options.model } : {}, policy: role.policy, name: `${role.name} \xB7 Generation` });
     const expected = expectedBootstrap(store, project, role);
-    const candidate = store.createCandidate(project, roleKey, threadId, JSON.stringify(expected));
+    candidate = store.createCandidate(project, roleKey, threadId, JSON.stringify(expected));
     store.updateRotation(String(rotation.id), "BOOTSTRAPPING", { candidateId: candidate.id });
-    await client.setGoal(threadId, `Act as ${role.name}: ${role.mission}`);
-    const actual = options.deterministicBootstrap ? expected : await client.bootstrapHealth(threadId, expected, store.roleAnchor(project, roleKey));
-    const validation = store.validateBootstrap(project, roleKey, actual);
+    const validation = store.validateBootstrap(project, roleKey, expected);
     if (!validation.ok) {
       store.rejectCandidate(candidate.id, validation.errors.join("; "));
       store.updateRotation(String(rotation.id), "FAILED", { error: validation.errors.join("; ") });
@@ -1006,14 +963,31 @@ async function rotateRoleGeneration(store, project, roleKey, reason, options = {
     store.updateRotation(String(rotation.id), "COMPLETED");
     return { rotation_id: rotation.id, role: roleKey, generation: active, validation };
   } catch (error) {
+    if (candidate) {
+      try {
+        store.rejectCandidate(candidate.id, `Bootstrap failed: ${error instanceof Error ? error.message : String(error)}`);
+      } catch {
+      }
+    }
     try {
       store.updateRotation(String(rotation.id), "FAILED", { error: error instanceof Error ? error.message : String(error) });
     } catch {
     }
     throw error;
   } finally {
-    client.close();
+    client?.close();
   }
+}
+async function startRoleGeneration(store, project, roleKey, options = {}) {
+  const active = store.activeGeneration(project, roleKey);
+  if (active) return { role: roleKey, status: "active", started: false, generation: active };
+  const candidate = store.bootstrappingGeneration(project, roleKey);
+  const rotation = store.openRotation(project, roleKey);
+  if (candidate && rotation) return { role: roleKey, status: "bootstrapping", started: false, generation: candidate, rotation_id: rotation.id };
+  if (candidate) store.rejectCandidate(candidate.id, "Recovered orphaned bootstrap candidate before retrying role_start.");
+  if (rotation) return { role: roleKey, status: "starting", started: false, rotation_id: rotation.id };
+  const result = await rotateRoleGeneration(store, project, roleKey, "initial generation", options);
+  return { ...result, status: "active", started: true };
 }
 async function dispatchLiaisonRequest(store, project, input) {
   const liaison = store.getRole(project, "liaison");
@@ -1087,5 +1061,6 @@ export {
   stableHash,
   stableId,
   stableJson,
+  startRoleGeneration,
   uniqueStrings
 };

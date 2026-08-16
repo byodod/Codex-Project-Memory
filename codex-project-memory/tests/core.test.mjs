@@ -83,6 +83,25 @@ test("FTS retrieval boosts exact symbols and supersession hides stale decisions"
   }
 });
 
+test("FTS relevance is not discarded by authority boosts and returned recall metadata is current", () => {
+  const { store, project } = fixture();
+  try {
+    store.storeMemory(project, {
+      kind: "decision", summary: "Generic Hook policy", content: "Hooks are enabled for this project.",
+      authority: "user_decision", importance: 1
+    });
+    const failure = store.storeMemory(project, {
+      kind: "failure", summary: "Coordinator bootstrap timeout", content: "role_start left a bootstrapping candidate after a coordinator timeout and recursive retry",
+      authority: "tool_observation", importance: 1
+    });
+    const results = store.search(project, "coordinator bootstrap timeout recursive role_start candidate", { limit: 5 });
+    assert.equal(results[0].id, failure.id);
+    assert.equal(results[0].recall_count, 1);
+    assert.ok(results[0].last_recalled_at);
+    assert.equal(store.getMemory(project, failure.id).recall_count, 1);
+  } finally { store.close(); }
+});
+
 test("consolidation previews and archives only exact normalized duplicates", () => {
   const { store, project } = fixture();
   try {

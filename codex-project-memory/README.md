@@ -1,6 +1,6 @@
-# Codex Project Memory
+# Codex Project Runtime
 
-A Codex-native long-horizon memory plugin for software projects. It combines lifecycle Hooks, a local MCP server, SQLite FTS5, provenance labels, compact task snapshots, pre-compaction checkpoints, and a completion gate.
+A single Codex plugin that combines long-horizon project memory with persistent role orchestration. It bundles two local MCP control planes, one integrated lifecycle Hook, SQLite FTS5 recall, a user-facing Liaison, an internal Coordinator, typed role routing, replaceable role task generations, checkpoints, verification evidence, and a completion gate.
 
 It is designed to prevent the failures that matter during long development work:
 
@@ -10,7 +10,7 @@ It is designed to prevent the failures that matter during long development work:
 - treating tool output or web text as authoritative instructions;
 - claiming completion before acceptance criteria and verification are satisfied.
 
-The plugin is local-only, offline, and requires no OpenAI API key.
+The plugin is local-only, offline, and requires no OpenAI API key. The former standalone Role Runtime remains a source component in this repository, but users install only `codex-project-memory`; the installer removes the duplicate standalone installation while preserving its existing role database.
 
 ## Install
 
@@ -32,7 +32,9 @@ npm test
 sh ./scripts/install.sh
 ```
 
-Then restart Codex and begin a new task. Plugin hooks are non-managed code: open `/hooks`, inspect them, and trust the current definitions. The MCP server is exposed as `project_memory`.
+Then restart Codex and begin a new task. Plugin hooks are non-managed code: open `/hooks`, inspect them, and trust the current definitions. The plugin exposes `project_memory` and `role_runtime` MCP servers.
+
+To initialize the default role topology, send `初始化角色编排`. The integrated Hook binds the current task as `role://liaison` and deterministically starts `role://coordinator` before the Liaison model turn begins.
 
 ## Normal Codex workflow
 
@@ -67,23 +69,25 @@ The `Stop` Hook asks Codex for one continuation when an enabled active task stil
 
 Always pass the current repository directory as `cwd` when calling MCP tools.
 
+Role Runtime adds role definition/status, `role_start`, role facts, task graph, typed mailboxes, Liaison-to-Coordinator requests, change envelopes, architecture epochs, and atomic generation rotation. Project Memory remains the durable user-level completion contract; Role Runtime is the internal execution graph.
+
 ## Hook behavior
 
 | Hook | Behavior |
 |---|---|
-| `SessionStart(startup/resume/compact)` | Inject a short task rehydration pack and curated memory |
-| `UserPromptSubmit` | Record a redacted prompt event and recall relevant history |
-| `PreToolUse` | Recall file/symbol/error/failure context for Bash and edits |
-| `PostToolUse` | Capture bounded, redacted objective tool evidence with a fast local write |
-| `PreCompact` | Atomically checkpoint task and recent event identifiers |
-| `Stop` | Continue once if the active completion gate remains open |
-| `SessionEnd` | Refresh human-readable exports |
+| `SessionStart(startup/resume/clear/compact)` | Merge task/memory rehydration with the active role anchor |
+| `UserPromptSubmit` | Recall relevant memory, initialize exact role prompts, and reject stale role generations |
+| `PreToolUse` | Merge relevant memory with role permission enforcement |
+| `PostToolUse` | Capture bounded objective evidence and role events |
+| `PreCompact` / `PostCompact` | Checkpoint project state and update role-generation health |
+| `Stop` | Enforce the project completion gate and record role stop state |
+| `SessionEnd` | Refresh memory exports and close the role-generation session |
 
-Hooks never rewrite or deny tool calls. Automatic failure capture remains low-importance episodic memory until explicitly curated.
+Memory recall never rewrites tool calls. Role policy can deny stale generations or tools outside a role's charter. Automatic failure capture remains low-importance episodic memory until explicitly curated.
 
 ## Storage and inspection
 
-When installed, Codex supplies `PLUGIN_DATA` to hooks and the installer gives the MCP server the same per-plugin directory through `CODEX_PROJECT_MEMORY_HOME`. Standalone development uses `~/.codex-project-memory` or an explicit `CODEX_PROJECT_MEMORY_HOME`.
+Hooks, MCP, and the CLI all use `~/.codex/plugin-data/codex-project-memory` by default. Codex supplies `PLUGIN_DATA` to Hooks, while the installer gives MCP the same directory through `CODEX_PROJECT_MEMORY_HOME`; either variable can explicitly override the default for testing or migration. This avoids the old split where the CLI silently read `~/.codex-project-memory` while MCP used the plugin database.
 
 ```text
 <data-root>/
@@ -92,6 +96,8 @@ When installed, Codex supplies `PLUGIN_DATA` to hooks and the installer gives th
     MEMORY.md
     tasks/<task-id>.json
 ```
+
+Existing Role Runtime data remains under `~/.codex/plugin-data/codex-role-runtime/role-runtime.sqlite3`, so upgrading to the unified plugin does not reset active roles or audit history.
 
 Inspect the current project without Codex:
 
@@ -112,7 +118,7 @@ npm run doctor
 npm run pack:check
 ```
 
-The tests exercise task completion gates, FTS/symbol ranking, supersession, duplicate consolidation, Hook rehydration/recall/checkpoint/redaction, and a real MCP stdio client/server exchange.
+The tests exercise task completion gates, FTS relevance and recall metadata, supersession, duplicate consolidation, merged Hook behavior, role startup cleanup/idempotency, and real stdio exchanges with both MCP servers.
 
 ## Updating a local installation
 

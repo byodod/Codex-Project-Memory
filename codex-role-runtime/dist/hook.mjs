@@ -1,8 +1,209 @@
 // src/hook.ts
 import { readFileSync } from "node:fs";
 
+// src/app-server.ts
+import { execFileSync, spawn } from "node:child_process";
+import { createInterface } from "node:readline";
+function resolveCodexBinary() {
+  if (process.env.CODEX_BIN) {
+    return process.env.CODEX_BIN;
+  }
+  if (process.platform === "win32") {
+    try {
+      const candidates = execFileSync("where.exe", ["codex.cmd"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+      if (candidates[0]) return candidates[0];
+    } catch {
+    }
+  }
+  return "codex";
+}
+var AppServerClient = class _AppServerClient {
+  child;
+  lines;
+  nextId = 1;
+  pending = /* @__PURE__ */ new Map();
+  listeners = /* @__PURE__ */ new Set();
+  stderr = [];
+  constructor(command = resolveCodexBinary()) {
+    this.child = spawn(command, ["app-server", "--stdio"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+      shell: process.platform === "win32" && !command.toLowerCase().endsWith(".exe")
+    });
+    this.lines = createInterface({ input: this.child.stdout });
+    this.lines.on("line", (line) => this.onLine(line));
+    this.child.stderr.setEncoding("utf8");
+    this.child.stderr.on("data", (chunk) => {
+      this.stderr.push(chunk);
+      if (this.stderr.length > 50) this.stderr.shift();
+    });
+    this.child.on("exit", (code) => {
+      for (const waiter of this.pending.values()) {
+        clearTimeout(waiter.timer);
+        waiter.reject(new Error(`Codex app-server exited with ${code}. ${this.stderr.join("").slice(-2e3)}`));
+      }
+      this.pending.clear();
+    });
+  }
+  static async connect() {
+    const client = new _AppServerClient();
+    await client.request("initialize", { clientInfo: { name: "codex-role-runtime", title: "Codex Role Runtime", version: "1.0.0" } });
+    client.notify("initialized", {});
+    return client;
+  }
+  onLine(line) {
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (typeof message.id === "number" && (message.result !== void 0 || message.error !== void 0)) {
+      const waiter = this.pending.get(message.id);
+      if (!waiter) return;
+      clearTimeout(waiter.timer);
+      this.pending.delete(message.id);
+      if (message.error) waiter.reject(new Error(`App Server RPC error: ${JSON.stringify(message.error)}`));
+      else waiter.resolve(message.result);
+      return;
+    }
+    for (const listener of this.listeners) listener(message);
+  }
+  request(method, params, timeoutMs = 3e4) {
+    const id = this.nextId++;
+    return new Promise((resolve2, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`App Server timeout: ${method}`));
+      }, timeoutMs);
+      this.pending.set(id, { resolve: resolve2, reject, timer });
+      this.child.stdin.write(`${JSON.stringify({ method, id, params })}
+`);
+    });
+  }
+  notify(method, params) {
+    this.child.stdin.write(`${JSON.stringify({ method, params })}
+`);
+  }
+  async startThread(input2) {
+    const params = {
+      cwd: input2.cwd,
+      approvalPolicy: "never",
+      sandbox: input2.policy.mode === "read_only" ? "read-only" : "workspace-write",
+      serviceName: "codex-role-runtime"
+    };
+    if (input2.model) params.model = input2.model;
+    const result = await this.request("thread/start", params, 6e4);
+    const threadId = result?.thread?.id;
+    if (!threadId) throw new Error(`thread/start returned no thread id: ${JSON.stringify(result)}`);
+    await this.request("thread/name/set", { threadId, name: input2.name }).catch(() => void 0);
+    return threadId;
+  }
+  async resumeThread(threadId) {
+    const result = await this.request("thread/resume", { threadId }, 6e4);
+    if (result?.thread?.id !== threadId) throw new Error(`thread/resume returned the wrong thread: ${JSON.stringify(result)}`);
+  }
+  async runTurn(threadId, prompt, timeoutMs = 9e5) {
+    await this.resumeThread(threadId);
+    let lastText = "";
+    const completed = new Promise((resolve2, reject) => {
+      const timer = setTimeout(() => {
+        this.listeners.delete(listener);
+        reject(new Error("Role dispatch turn timed out."));
+      }, timeoutMs);
+      const listener = (message) => {
+        const params = message.params || {};
+        if (params.threadId && params.threadId !== threadId) return;
+        if (message.method === "item/agentMessage/delta") lastText += params.delta || "";
+        if (message.method === "item/completed" && params.item?.type === "agentMessage") lastText = params.item.text || lastText;
+        if (message.method === "turn/completed") {
+          clearTimeout(timer);
+          this.listeners.delete(listener);
+          if (params.turn?.status && !["completed", "Completed"].includes(params.turn.status)) reject(new Error(`Role dispatch turn ${params.turn.status}`));
+          else resolve2();
+        }
+      };
+      this.listeners.add(listener);
+    });
+    await this.request("turn/start", { threadId, input: [{ type: "text", text: prompt }] }, 6e4);
+    await completed;
+    return lastText.trim();
+  }
+  close() {
+    this.lines.close();
+    this.child.stdin.end();
+    this.child.kill();
+  }
+};
+
+// src/generation-service.ts
+function expectedBootstrap(store2, project, role) {
+  const context2 = store2.context(project, role.role_key);
+  const facts = context2.facts;
+  return {
+    role_id: role.role_key,
+    mission: role.mission,
+    owned_domains: role.owned_domains,
+    critical_invariants: facts.filter((fact) => fact.kind === "invariant").map((fact) => String(fact.content)),
+    open_questions: facts.filter((fact) => fact.kind === "open_question").map((fact) => String(fact.content)),
+    architecture_epoch: Number(context2.project.architecture_epoch)
+  };
+}
+async function rotateRoleGeneration(store2, project, roleKey, reason, options = {}) {
+  const role = store2.getRole(project, roleKey);
+  if (!role) throw new Error(`Unknown role: ${roleKey}`);
+  const rotation = store2.createRotation(project, roleKey, reason);
+  let client = null;
+  let candidate = null;
+  try {
+    client = options.clientFactory ? await options.clientFactory() : await AppServerClient.connect();
+    store2.updateRotation(String(rotation.id), "DRAINING");
+    store2.updateRotation(String(rotation.id), "CHECKPOINTING");
+    store2.updateRotation(String(rotation.id), "VALIDATING");
+    const threadId = await client.startThread({ cwd: project.root, ...options.model ? { model: options.model } : {}, policy: role.policy, name: `${role.name} \xB7 Generation` });
+    const expected = expectedBootstrap(store2, project, role);
+    candidate = store2.createCandidate(project, roleKey, threadId, JSON.stringify(expected));
+    store2.updateRotation(String(rotation.id), "BOOTSTRAPPING", { candidateId: candidate.id });
+    const validation = store2.validateBootstrap(project, roleKey, expected);
+    if (!validation.ok) {
+      store2.rejectCandidate(candidate.id, validation.errors.join("; "));
+      store2.updateRotation(String(rotation.id), "FAILED", { error: validation.errors.join("; ") });
+      throw new Error(`Bootstrap rejected: ${validation.errors.join("; ")}`);
+    }
+    store2.updateRotation(String(rotation.id), "CUTOVER");
+    const active = store2.activateCandidate(project, roleKey, candidate.id, reason);
+    store2.updateRotation(String(rotation.id), "COMPLETED");
+    return { rotation_id: rotation.id, role: roleKey, generation: active, validation };
+  } catch (error) {
+    if (candidate) {
+      try {
+        store2.rejectCandidate(candidate.id, `Bootstrap failed: ${error instanceof Error ? error.message : String(error)}`);
+      } catch {
+      }
+    }
+    try {
+      store2.updateRotation(String(rotation.id), "FAILED", { error: error instanceof Error ? error.message : String(error) });
+    } catch {
+    }
+    throw error;
+  } finally {
+    client?.close();
+  }
+}
+async function startRoleGeneration(store2, project, roleKey, options = {}) {
+  const active = store2.activeGeneration(project, roleKey);
+  if (active) return { role: roleKey, status: "active", started: false, generation: active };
+  const candidate = store2.bootstrappingGeneration(project, roleKey);
+  const rotation = store2.openRotation(project, roleKey);
+  if (candidate && rotation) return { role: roleKey, status: "bootstrapping", started: false, generation: candidate, rotation_id: rotation.id };
+  if (candidate) store2.rejectCandidate(candidate.id, "Recovered orphaned bootstrap candidate before retrying role_start.");
+  if (rotation) return { role: roleKey, status: "starting", started: false, rotation_id: rotation.id };
+  const result = await rotateRoleGeneration(store2, project, roleKey, "initial generation", options);
+  return { ...result, status: "active", started: true };
+}
+
 // src/project.ts
-import { execFileSync } from "node:child_process";
+import { execFileSync as execFileSync2 } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 
@@ -63,7 +264,7 @@ function redact(value) {
 // src/project.ts
 function git(cwd, args) {
   try {
-    return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() || null;
+    return execFileSync2("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() || null;
   } catch {
     return null;
   }
@@ -126,7 +327,7 @@ var RoleStore = class {
   db;
   constructor(root) {
     const codexHome = process.env.CODEX_HOME || join(homedir(), ".codex");
-    this.root = root || process.env.PLUGIN_DATA || process.env.CODEX_ROLE_RUNTIME_HOME || join(codexHome, "plugin-data", "codex-role-runtime");
+    this.root = root || process.env.CODEX_ROLE_RUNTIME_HOME || process.env.PLUGIN_DATA || join(codexHome, "plugin-data", "codex-role-runtime");
     mkdirSync(this.root, { recursive: true });
     this.databasePath = join(this.root, "role-runtime.sqlite3");
     this.db = new DatabaseSync(this.databasePath);
@@ -351,6 +552,18 @@ var RoleStore = class {
     const row = this.db.prepare("SELECT * FROM role_generations WHERE role_id=? AND status='active'").get(role.id);
     return row ? generationFromRow(row) : null;
   }
+  bootstrappingGeneration(project, roleKey) {
+    const role = this.getRole(project, roleKey);
+    if (!role) return null;
+    const row = this.db.prepare("SELECT * FROM role_generations WHERE role_id=? AND status='bootstrapping'").get(role.id);
+    return row ? generationFromRow(row) : null;
+  }
+  openRotation(project, roleKey) {
+    const role = this.getRole(project, roleKey);
+    if (!role) return null;
+    const row = this.db.prepare("SELECT * FROM rotations WHERE role_id=? AND state NOT IN ('COMPLETED','FAILED') ORDER BY created_at DESC LIMIT 1").get(role.id);
+    return row || null;
+  }
   bindInitial(project, roleKey, threadId) {
     const role = this.getRole(project, roleKey);
     if (!role) throw new Error(`Unknown role: ${roleKey}`);
@@ -378,14 +591,12 @@ var RoleStore = class {
   createCandidate(project, roleKey, threadId, bootstrapHash) {
     const role = this.getRole(project, roleKey);
     if (!role) throw new Error(`Unknown role: ${roleKey}`);
-    const current = this.activeGeneration(project, roleKey);
     const max = this.db.prepare("SELECT coalesce(max(generation_number),0) n FROM role_generations WHERE role_id=?").get(role.id);
     const number = Number(max.n) + 1;
     const time = nowIso();
     const id = newId("gen");
     this.db.prepare(`INSERT INTO role_generations(id,role_id,generation_number,thread_id,status,health,architecture_epoch,bootstrap_hash,started_at,last_seen_at)
       VALUES(?,?,?,?,?,?,?,?,?,?)`).run(id, role.id, number, threadId, "bootstrapping", "healthy", this.projectEpoch(project), bootstrapHash || null, time, time);
-    if (!current && number !== 1) throw new Error("INVALID_INITIAL_GENERATION");
     return generationFromRow(this.db.prepare("SELECT * FROM role_generations WHERE id=?").get(id));
   }
   activateCandidate(project, roleKey, candidateId, reason) {
@@ -657,10 +868,10 @@ var RoleStore = class {
       context_hash: stableHash({ project: projectRow.constitution, epoch: projectRow.architecture_epoch, role, facts, tasks })
     };
   }
-  roleAnchor(project, roleKey) {
+  roleAnchor(project, roleKey, generationOverride) {
     const context2 = this.context(project, roleKey);
     const role = context2.role;
-    const generation = context2.active_generation;
+    const generation = generationOverride ?? context2.active_generation;
     const facts = context2.facts;
     const invariants = facts.filter((fact) => fact.kind === "invariant").slice(0, 8);
     const tasks = context2.tasks;
@@ -668,7 +879,7 @@ var RoleStore = class {
     return [
       "[Codex Role Runtime]",
       `Role: ${role.name} (role://${role.role_key})`,
-      `Generation: ${generation?.generation_number ?? "unbound"}; Architecture epoch: ${context2.project.architecture_epoch}`,
+      `Generation: ${generation?.generation_number ?? "unbound"}${generation ? ` (${generation.status})` : ""}; Architecture epoch: ${context2.project.architecture_epoch}`,
       `Mission: ${role.mission}`,
       `Owns: ${role.owned_domains.join(", ") || "none declared"}`,
       `Does not own: ${role.excluded_domains.join(", ") || "none declared"}`,
@@ -788,7 +999,14 @@ try {
         process.exit(0);
       }
       const generation2 = store.bindInitial(project, "liaison", input.session_id);
-      process.stdout.write(JSON.stringify(context(input.hook_event_name, `Role orchestration initialized. This task is the user's communication entry point.
+      const testCoordinatorThread = process.env.CODEX_ROLE_RUNTIME_TEST_COORDINATOR_THREAD;
+      const coordinator = await startRoleGeneration(store, project, "coordinator", testCoordinatorThread ? {
+        clientFactory: async () => ({ async startThread() {
+          return testCoordinatorThread;
+        }, close() {
+        } })
+      } : {});
+      process.stdout.write(JSON.stringify(context(input.hook_event_name, `Role orchestration initialized. This task is the user's communication entry point; role://coordinator status is ${coordinator.status}.
 ${store.roleAnchor(project, "liaison")}
 Send structured user intent to role://coordinator; relay its questions, progress, blockers, and verified results back to the user.`)));
       process.exit(0);
@@ -808,11 +1026,14 @@ ${store.roleAnchor(project, claim[1])}`)));
     process.exit(0);
   }
   const { role, generation } = binding;
-  const stale = generation.status !== "active";
+  const bootstrapping = generation.status === "bootstrapping";
+  const stale = generation.status === "retired" || generation.status === "rejected";
   const eventKey = `${input.session_id}:${input.turn_id || input.tool_use_id || input.trigger || input.source || input.hook_event_name}:${input.hook_event_name}`;
   switch (input.hook_event_name) {
     case "SessionStart":
       if (stale) process.stdout.write(JSON.stringify({ continue: false, stopReason: `STALE_GENERATION: role://${role.role_key} now uses another thread.` }));
+      else if (bootstrapping) process.stdout.write(JSON.stringify(context("SessionStart", `This task is a bootstrap candidate and is not active yet. Do not perform project work until deterministic cutover completes.
+${store.roleAnchor(project, role.role_key, generation)}`)));
       else {
         store.observeGeneration(project, input.session_id, { event: "session_start", eventKey });
         process.stdout.write(JSON.stringify(context("SessionStart", store.roleAnchor(project, role.role_key))));
@@ -820,6 +1041,7 @@ ${store.roleAnchor(project, claim[1])}`)));
       break;
     case "UserPromptSubmit":
       if (stale) process.stdout.write(JSON.stringify(deny("UserPromptSubmit", `STALE_GENERATION: this thread is retired for role://${role.role_key}. Open its current generation.`)));
+      else if (bootstrapping) process.stdout.write(JSON.stringify(deny("UserPromptSubmit", `BOOTSTRAPPING_GENERATION: role://${role.role_key} candidate ${generation.generation_number} is awaiting deterministic cutover.`)));
       else {
         store.observeGeneration(project, input.session_id, { event: "turn", eventKey });
         process.stdout.write(JSON.stringify(context("UserPromptSubmit", store.roleAnchor(project, role.role_key))));
@@ -828,6 +1050,10 @@ ${store.roleAnchor(project, claim[1])}`)));
     case "PreToolUse": {
       if (stale) {
         process.stdout.write(JSON.stringify(deny("PreToolUse", `STALE_GENERATION: retired generation ${generation.generation_number} cannot use tools.`)));
+        break;
+      }
+      if (bootstrapping) {
+        process.stdout.write(JSON.stringify(deny("PreToolUse", `BOOTSTRAPPING_GENERATION: candidate ${generation.generation_number} cannot use tools before deterministic cutover.`)));
         break;
       }
       const tool = input.tool_name || "";

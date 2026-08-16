@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { resolveProject } from "./project.js";
-import { dispatchLiaisonRequest, rotateRoleGeneration } from "./generation-service.js";
+import { dispatchLiaisonRequest, startRoleGeneration } from "./generation-service.js";
 import { RoleStore } from "./store.js";
 import { initializeStandardTopology } from "./topology.js";
 import { FACT_KINDS, MESSAGE_TYPES, ROLE_KINDS } from "./types.js";
@@ -68,12 +68,9 @@ tool("role_bind", {
 }, ({ cwd, role_key, thread_id }: any) => run(cwd, (store, project) => store.bindInitial(project, role_key, thread_id)));
 
 tool("role_start", {
-  title: "Start initial role task", description: "Create and validate the first Codex task generation for a standard role through App Server. Use this to start the Coordinator after one-prompt initialization.",
-  inputSchema: { cwd, role_key: z.string(), model: z.string().optional() }, annotations: { readOnlyHint: false, idempotentHint: false }
-}, ({ cwd, role_key, model }: any) => runAsync(cwd, async (store, project) => {
-  if (store.activeGeneration(project, role_key)) throw new Error("ROLE_ALREADY_HAS_ACTIVE_GENERATION");
-  return rotateRoleGeneration(store, project, role_key, "initial generation", { ...(model ? { model } : {}) });
-}));
+  title: "Start initial role task", description: "Idempotently create and deterministically activate the first Codex task generation for a standard role through App Server. Use this to start the Coordinator after one-prompt initialization.",
+  inputSchema: { cwd, role_key: z.string(), model: z.string().optional() }, annotations: { readOnlyHint: false, idempotentHint: true }
+}, ({ cwd, role_key, model }: any) => runAsync(cwd, (store, project) => startRoleGeneration(store, project, role_key, { ...(model ? { model } : {}) })));
 
 tool("role_context_get", {
   title: "Get layered role context", description: "Read the L0 constitution, L1 charter/state, active L2 tasks, generation, epoch, and pending mailbox count.",

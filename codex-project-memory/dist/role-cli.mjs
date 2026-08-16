@@ -1,7 +1,7 @@
-// src/cli.ts
+// ../codex-role-runtime/src/cli.ts
 import { spawnSync } from "node:child_process";
 
-// src/app-server.ts
+// ../codex-role-runtime/src/app-server.ts
 import { execFileSync, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 function resolveCodexBinary() {
@@ -136,7 +136,7 @@ var AppServerClient = class _AppServerClient {
   }
 };
 
-// src/generation-service.ts
+// ../codex-role-runtime/src/generation-service.ts
 function expectedBootstrap(store2, project2, role) {
   const context = store2.context(project2, role.role_key);
   const facts = context.facts;
@@ -202,12 +202,12 @@ async function startRoleGeneration(store2, project2, roleKey, options = {}) {
   return { ...result, status: "active", started: true };
 }
 
-// src/project.ts
+// ../codex-role-runtime/src/project.ts
 import { execFileSync as execFileSync2 } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 
-// src/util.ts
+// ../codex-role-runtime/src/util.ts
 import { createHash, randomUUID } from "node:crypto";
 function nowIso() {
   return (/* @__PURE__ */ new Date()).toISOString();
@@ -257,7 +257,7 @@ function matchesAny(value, patterns) {
   });
 }
 
-// src/project.ts
+// ../codex-role-runtime/src/project.ts
 function git(cwd2, args2) {
   try {
     return execFileSync2("git", args2, { cwd: cwd2, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() || null;
@@ -285,7 +285,7 @@ function resolveProject(input = process.cwd()) {
   };
 }
 
-// src/store.ts
+// ../codex-role-runtime/src/store.ts
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
@@ -900,7 +900,7 @@ var RoleStore = class {
   }
 };
 
-// src/topology.ts
+// ../codex-role-runtime/src/topology.ts
 var STANDARD_CONSTITUTION = "Preserve modular boundaries, route user communication through the Liaison, route project work through the Coordinator, route cross-domain decisions through semantic owners, and require independent verification.";
 var STANDARD_ROLES = [
   {
@@ -958,7 +958,7 @@ function initializeStandardTopology(store2, project2, constitution) {
   };
 }
 
-// src/cli.ts
+// ../codex-role-runtime/src/cli.ts
 var raw = process.argv.slice(2);
 function option(name) {
   const at = raw.indexOf(name);
