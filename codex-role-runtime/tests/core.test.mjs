@@ -4,7 +4,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { initializeStandardTopology, RoleStore, resolveProject, rotateRoleGeneration, startRoleGeneration } from "../dist/library.mjs";
+import { dispatchRoleMessage, initializeStandardTopology, RoleStore, resolveProject, rotateRoleGeneration, startRoleGeneration } from "../dist/library.mjs";
 
 function fixture() {
   const cwd = mkdtempSync(join(tmpdir(), "codex-role-project-"));
@@ -147,10 +147,95 @@ test("typed messages are idempotent and reject stale generation or architecture"
     const input = { message_id: "msg-fixed", type: "ASSIGN", from_role: "architect", to_role: "implementer", from_generation: 1, architecture_epoch: 1, scope: "src/", payload: { task: "T1" } };
     store.sendMessage(project, input); store.sendMessage(project, input);
     assert.equal(store.db.prepare("SELECT count(*) n FROM messages WHERE id='msg-fixed'").get().n, 1);
+    assert.throws(() => store.sendMessage(project, { ...input, payload: { task: "different" } }), /MESSAGE_ID_CONFLICT/);
     assert.equal(store.inbox(project, "implementer").length, 1);
     store.acknowledgeMessage(project, "implementer", "msg-fixed");
     store.advanceArchitecture(project, "new boundary");
     assert.throws(() => store.sendMessage(project, { ...input, message_id: "msg-stale", architecture_epoch: 1 }), /STALE_ARCHITECTURE_EPOCH/);
+  } finally { store.close(); }
+});
+
+test("Coordinator assignments start and wake recipient tasks exactly once", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "codex-role-dispatch-project-"));
+  const data = mkdtempSync(join(tmpdir(), "codex-role-dispatch-data-"));
+  const store = new RoleStore(data); const project = resolveProject(cwd);
+  initializeStandardTopology(store, project);
+  store.bindInitial(project, "coordinator", "thr-coordinator");
+  const turns = [];
+  const input = {
+    message_id: "dispatch-once", type: "ASSIGN", from_role: "coordinator", to_role: "architect",
+    from_generation: 1, architecture_epoch: 1, payload: { work: "Inspect boundaries" }
+  };
+  try {
+    const first = await dispatchRoleMessage(store, project, input, {
+      generationOptions: { clientFactory: async () => ({ async startThread() { return "thr-architect"; }, close() {} }) },
+      clientFactory: async () => ({
+        async runTurn(threadId, prompt) { turns.push({ threadId, prompt }); store.inbox(project, "architect"); return "Architecture checked"; },
+        close() {}
+      })
+    });
+    assert.equal(first.wake.status, "completed");
+    assert.equal(first.wake.response, "Architecture checked");
+    assert.equal(store.activeGeneration(project, "architect").thread_id, "thr-architect");
+    assert.equal(store.message(project, "dispatch-once").wake_status, "completed");
+    assert.equal(turns.length, 1);
+    assert.match(turns[0].prompt, /active work turn/);
+
+    const repeated = await dispatchRoleMessage(store, project, input, {
+      generationOptions: { clientFactory: async () => { throw new Error("must not create another task"); } },
+      clientFactory: async () => { throw new Error("must not wake twice"); }
+    });
+    assert.equal(repeated.wake.status, "completed");
+    assert.equal(repeated.wake.deduplicated, true);
+    assert.equal(turns.length, 1);
+  } finally { store.close(); }
+});
+
+test("failed role wake retries and result traffic never wakes Coordinator recursively", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "codex-role-wake-retry-project-"));
+  const data = mkdtempSync(join(tmpdir(), "codex-role-wake-retry-data-"));
+  const store = new RoleStore(data); const project = resolveProject(cwd);
+  initializeStandardTopology(store, project);
+  store.bindInitial(project, "coordinator", "thr-coordinator");
+  store.bindInitial(project, "verifier", "thr-verifier");
+  const input = {
+    message_id: "wake-retry", type: "VERIFY_REQUEST", from_role: "coordinator", to_role: "verifier",
+    from_generation: 1, architecture_epoch: 1, payload: { verify: "acceptance" }
+  };
+  try {
+    await assert.rejects(dispatchRoleMessage(store, project, input, {
+      clientFactory: async () => ({ async runTurn() { throw new Error("temporary resume failure"); }, close() {} })
+    }), /ROLE_WAKE_FAILED/);
+    assert.equal(store.message(project, "wake-retry").wake_status, "failed");
+
+    const retried = await dispatchRoleMessage(store, project, input, {
+      clientFactory: async () => ({ async runTurn() { return "verified"; }, close() {} })
+    });
+    assert.equal(retried.wake.status, "completed");
+
+    const result = await dispatchRoleMessage(store, project, {
+      message_id: "result-no-recursion", type: "RESULT", from_role: "verifier", to_role: "coordinator",
+      from_generation: 1, architecture_epoch: 1, payload: { result: "passed" }
+    }, { clientFactory: async () => { throw new Error("Coordinator must not be recursively woken"); } });
+    assert.equal(result.wake.status, "not_required");
+  } finally { store.close(); }
+});
+
+test("role reset deletes only the resolved project's full control-plane graph", () => {
+  const { store, project } = fixture();
+  try {
+    store.bindInitial(project, "architect", "thr-reset");
+    store.observeGeneration(project, "thr-reset", { event: "turn", eventKey: "reset-turn" });
+    const task = store.upsertTask(project, { owner_role: "architect", title: "Reset me", goal: "Populate graph" });
+    store.createEnvelope(project, { task_id: task.id, owner_role: "architect", intent: "Populate reset graph", allowed_scope: ["^src/"] });
+    store.createRotation(project, "architect", "Populate reset graph");
+    store.sendMessage(project, { type: "ASSIGN", from_role: "architect", to_role: "implementer", from_generation: 1, architecture_epoch: 1, task_id: task.id, payload: {} });
+    const reset = store.resetProject(project);
+    assert.equal(reset.deleted, true);
+    assert.equal(reset.counts.roles, 2);
+    assert.equal(store.db.prepare("SELECT count(*) n FROM projects WHERE id=?").get(project.id).n, 0);
+    assert.equal(store.db.prepare("SELECT count(*) n FROM role_generations").get().n, 0);
+    assert.equal(store.db.prepare("SELECT count(*) n FROM messages").get().n, 0);
   } finally { store.close(); }
 });
 

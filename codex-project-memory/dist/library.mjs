@@ -1,8 +1,8 @@
 // src/storage.ts
 import { DatabaseSync } from "node:sqlite";
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { mkdirSync as mkdirSync2 } from "node:fs";
+import { join, resolve, sep } from "node:path";
+import { mkdirSync as mkdirSync2, rmSync } from "node:fs";
 
 // src/util.ts
 import { createHash, randomUUID } from "node:crypto";
@@ -560,6 +560,23 @@ var MemoryStore = class {
     }
     return { apply, exact_duplicates: duplicates, changed: apply ? duplicates.length : 0 };
   }
+  resetProject(project) {
+    const existing = this.db.prepare("SELECT id,root,name FROM projects WHERE id=?").get(project.id);
+    if (!existing) return { project_id: project.id, root: project.root, deleted: false, counts: {}, export_removed: false };
+    const counts = {
+      tasks: Number(this.db.prepare("SELECT count(*) n FROM tasks WHERE project_id=?").get(project.id).n),
+      memories: Number(this.db.prepare("SELECT count(*) n FROM memories WHERE project_id=?").get(project.id).n),
+      events: Number(this.db.prepare("SELECT count(*) n FROM events WHERE project_id=?").get(project.id).n),
+      verifications: Number(this.db.prepare("SELECT count(*) n FROM verifications WHERE project_id=?").get(project.id).n),
+      checkpoints: Number(this.db.prepare("SELECT count(*) n FROM checkpoints WHERE project_id=?").get(project.id).n)
+    };
+    this.db.prepare("DELETE FROM projects WHERE id=?").run(project.id);
+    const projectsRoot = resolve(this.root, "projects");
+    const exportDirectory = resolve(projectsRoot, project.id);
+    if (!exportDirectory.startsWith(`${projectsRoot}${sep}`)) throw new Error("UNSAFE_PROJECT_EXPORT_PATH");
+    rmSync(exportDirectory, { recursive: true, force: true });
+    return { project_id: project.id, root: existing.root, deleted: true, counts, export_removed: true };
+  }
   exportProject(project) {
     const base = join(this.root, "projects", project.id);
     const memories = this.db.prepare(`
@@ -601,7 +618,7 @@ var MemoryStore = class {
 
 // src/repository.ts
 import { execFileSync } from "node:child_process";
-import { basename, isAbsolute, resolve } from "node:path";
+import { basename, isAbsolute, resolve as resolve2 } from "node:path";
 import { realpathSync } from "node:fs";
 function git(cwd, args) {
   try {
@@ -617,7 +634,7 @@ function git(cwd, args) {
   }
 }
 function normalizedPath(path) {
-  const absolute = resolve(path);
+  const absolute = resolve2(path);
   try {
     return realpathSync.native(absolute);
   } catch {
@@ -629,7 +646,7 @@ function resolveProject(cwdInput) {
   const topLevel = git(cwd, ["rev-parse", "--show-toplevel"]);
   const root = normalizedPath(topLevel || cwd);
   const commonRaw = git(root, ["rev-parse", "--git-common-dir"]);
-  const gitCommonDir = commonRaw ? normalizedPath(isAbsolute(commonRaw) ? commonRaw : resolve(root, commonRaw)) : null;
+  const gitCommonDir = commonRaw ? normalizedPath(isAbsolute(commonRaw) ? commonRaw : resolve2(root, commonRaw)) : null;
   const remote = git(root, ["config", "--get", "remote.origin.url"]);
   const branch = git(root, ["branch", "--show-current"]);
   const revision = git(root, ["rev-parse", "HEAD"]);

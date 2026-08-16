@@ -2983,7 +2983,7 @@ var require_compile = __commonJS({
       const schOrFunc = root.refs[ref];
       if (schOrFunc)
         return schOrFunc;
-      let _sch = resolve2.call(this, root, ref);
+      let _sch = resolve3.call(this, root, ref);
       if (_sch === void 0) {
         const schema = (_a3 = root.localRefs) === null || _a3 === void 0 ? void 0 : _a3[ref];
         const { schemaId } = this.opts;
@@ -3010,7 +3010,7 @@ var require_compile = __commonJS({
     function sameSchemaEnv(s1, s2) {
       return s1.schema === s2.schema && s1.root === s2.root && s1.baseId === s2.baseId;
     }
-    function resolve2(root, ref) {
+    function resolve3(root, ref) {
       let sch;
       while (typeof (sch = this.refs[ref]) == "string")
         ref = sch;
@@ -3641,7 +3641,7 @@ var require_fast_uri = __commonJS({
       }
       return uri;
     }
-    function resolve2(baseURI, relativeURI, options) {
+    function resolve3(baseURI, relativeURI, options) {
       const schemelessOptions = options ? Object.assign({ scheme: "null" }, options) : { scheme: "null" };
       const { parsed: baseParsed, malformedAuthorityOrPort: baseMalformed } = parseWithStatus(baseURI, schemelessOptions);
       const { parsed: relativeParsed, malformedAuthorityOrPort: relativeMalformed } = parseWithStatus(relativeURI, schemelessOptions);
@@ -3925,7 +3925,7 @@ var require_fast_uri = __commonJS({
     var fastUri = {
       SCHEMES,
       normalize,
-      resolve: resolve2,
+      resolve: resolve3,
       resolveComponent,
       equal,
       serialize,
@@ -28872,7 +28872,7 @@ var Protocol = class {
           return;
         }
         const pollInterval = task2.pollInterval ?? this._options?.defaultTaskPollInterval ?? 1e3;
-        await new Promise((resolve2) => setTimeout(resolve2, pollInterval));
+        await new Promise((resolve3) => setTimeout(resolve3, pollInterval));
         options?.signal?.throwIfAborted();
       }
     } catch (error51) {
@@ -28889,7 +28889,7 @@ var Protocol = class {
    */
   request(request, resultSchema, options) {
     const { relatedRequestId, resumptionToken, onresumptiontoken, task, relatedTask } = options ?? {};
-    return new Promise((resolve2, reject) => {
+    return new Promise((resolve3, reject) => {
       const earlyReject = (error51) => {
         reject(error51);
       };
@@ -28967,7 +28967,7 @@ var Protocol = class {
           if (!parseResult.success) {
             reject(parseResult.error);
           } else {
-            resolve2(parseResult.data);
+            resolve3(parseResult.data);
           }
         } catch (error51) {
           reject(error51);
@@ -29228,12 +29228,12 @@ var Protocol = class {
       }
     } catch {
     }
-    return new Promise((resolve2, reject) => {
+    return new Promise((resolve3, reject) => {
       if (signal.aborted) {
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
         return;
       }
-      const timeoutId = setTimeout(resolve2, interval);
+      const timeoutId = setTimeout(resolve3, interval);
       signal.addEventListener("abort", () => {
         clearTimeout(timeoutId);
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
@@ -30324,7 +30324,7 @@ var McpServer = class {
     let task = createTaskResult.task;
     const pollInterval = task.pollInterval ?? 5e3;
     while (task.status !== "completed" && task.status !== "failed" && task.status !== "cancelled") {
-      await new Promise((resolve2) => setTimeout(resolve2, pollInterval));
+      await new Promise((resolve3) => setTimeout(resolve3, pollInterval));
       const updatedTask = await extra.taskStore.getTask(taskId);
       if (!updatedTask) {
         throw new McpError(ErrorCode.InternalError, `Task ${taskId} not found during polling`);
@@ -30988,12 +30988,12 @@ var StdioServerTransport = class {
     this.onclose?.();
   }
   send(message) {
-    return new Promise((resolve2) => {
+    return new Promise((resolve3) => {
       const json2 = serializeMessage(message);
       if (this._stdout.write(json2)) {
-        resolve2();
+        resolve3();
       } else {
-        this._stdout.once("drain", resolve2);
+        this._stdout.once("drain", resolve3);
       }
     });
   }
@@ -31002,8 +31002,8 @@ var StdioServerTransport = class {
 // src/storage.ts
 import { DatabaseSync } from "node:sqlite";
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { mkdirSync as mkdirSync2 } from "node:fs";
+import { join, resolve, sep } from "node:path";
+import { mkdirSync as mkdirSync2, rmSync } from "node:fs";
 
 // src/util.ts
 import { createHash, randomUUID } from "node:crypto";
@@ -31561,6 +31561,23 @@ var MemoryStore = class {
     }
     return { apply, exact_duplicates: duplicates, changed: apply ? duplicates.length : 0 };
   }
+  resetProject(project) {
+    const existing = this.db.prepare("SELECT id,root,name FROM projects WHERE id=?").get(project.id);
+    if (!existing) return { project_id: project.id, root: project.root, deleted: false, counts: {}, export_removed: false };
+    const counts = {
+      tasks: Number(this.db.prepare("SELECT count(*) n FROM tasks WHERE project_id=?").get(project.id).n),
+      memories: Number(this.db.prepare("SELECT count(*) n FROM memories WHERE project_id=?").get(project.id).n),
+      events: Number(this.db.prepare("SELECT count(*) n FROM events WHERE project_id=?").get(project.id).n),
+      verifications: Number(this.db.prepare("SELECT count(*) n FROM verifications WHERE project_id=?").get(project.id).n),
+      checkpoints: Number(this.db.prepare("SELECT count(*) n FROM checkpoints WHERE project_id=?").get(project.id).n)
+    };
+    this.db.prepare("DELETE FROM projects WHERE id=?").run(project.id);
+    const projectsRoot = resolve(this.root, "projects");
+    const exportDirectory = resolve(projectsRoot, project.id);
+    if (!exportDirectory.startsWith(`${projectsRoot}${sep}`)) throw new Error("UNSAFE_PROJECT_EXPORT_PATH");
+    rmSync(exportDirectory, { recursive: true, force: true });
+    return { project_id: project.id, root: existing.root, deleted: true, counts, export_removed: true };
+  }
   exportProject(project) {
     const base = join(this.root, "projects", project.id);
     const memories = this.db.prepare(`
@@ -31602,7 +31619,7 @@ var MemoryStore = class {
 
 // src/repository.ts
 import { execFileSync } from "node:child_process";
-import { basename, isAbsolute, resolve } from "node:path";
+import { basename, isAbsolute, resolve as resolve2 } from "node:path";
 import { realpathSync } from "node:fs";
 function git(cwd2, args) {
   try {
@@ -31618,7 +31635,7 @@ function git(cwd2, args) {
   }
 }
 function normalizedPath(path) {
-  const absolute = resolve(path);
+  const absolute = resolve2(path);
   try {
     return realpathSync.native(absolute);
   } catch {
@@ -31630,7 +31647,7 @@ function resolveProject(cwdInput) {
   const topLevel = git(cwd2, ["rev-parse", "--show-toplevel"]);
   const root = normalizedPath(topLevel || cwd2);
   const commonRaw = git(root, ["rev-parse", "--git-common-dir"]);
-  const gitCommonDir = commonRaw ? normalizedPath(isAbsolute(commonRaw) ? commonRaw : resolve(root, commonRaw)) : null;
+  const gitCommonDir = commonRaw ? normalizedPath(isAbsolute(commonRaw) ? commonRaw : resolve2(root, commonRaw)) : null;
   const remote = git(root, ["config", "--get", "remote.origin.url"]);
   const branch = git(root, ["branch", "--show-current"]);
   const revision = git(root, ["rev-parse", "HEAD"]);

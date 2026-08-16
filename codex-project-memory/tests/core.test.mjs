@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryStore, resolveProject } from "../dist/library.mjs";
@@ -120,4 +120,24 @@ test("consolidation previews and archives only exact normalized duplicates", () 
   } finally {
     store.close();
   }
+});
+
+test("project reset removes every memory record and its human-readable export", () => {
+  const { store, project, data } = fixture();
+  try {
+    const task = store.upsertTask(project, { title: "Disposable", goal: "Populate all reset tables" });
+    store.storeMemory(project, { task_id: task.id, kind: "note", summary: "Disposable", content: "Delete me", authority: "agent_inference" });
+    store.recordEvent(project, { taskId: task.id, eventType: "test" });
+    store.recordVerification(project, { taskId: task.id, status: "passed", evidence: "test" });
+    store.checkpoint(project, { taskId: task.id, trigger: "test" });
+    const exportDirectory = join(data, "projects", project.id);
+    assert.equal(existsSync(exportDirectory), true);
+
+    const reset = store.resetProject(project);
+    assert.equal(reset.deleted, true);
+    assert.deepEqual(reset.counts, { tasks: 1, memories: 1, events: 1, verifications: 1, checkpoints: 1 });
+    assert.equal(existsSync(exportDirectory), false);
+    assert.equal(store.db.prepare("SELECT count(*) n FROM projects WHERE id=?").get(project.id).n, 0);
+    assert.equal(store.db.prepare("SELECT count(*) n FROM memories WHERE project_id=?").get(project.id).n, 0);
+  } finally { store.close(); }
 });

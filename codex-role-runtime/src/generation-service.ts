@@ -7,9 +7,20 @@ export interface GenerationClient {
   close(): void;
 }
 
+export interface DispatchClient {
+  runTurn(threadId: string, prompt: string, timeoutMs?: number): Promise<string>;
+  close(): void;
+}
+
 export interface GenerationOptions {
   model?: string;
   clientFactory?: () => Promise<GenerationClient>;
+}
+
+export interface DispatchOptions {
+  generationOptions?: GenerationOptions;
+  clientFactory?: () => Promise<DispatchClient>;
+  timeoutMs?: number;
 }
 
 export function expectedBootstrap(store: RoleStore, project: ProjectContext, role: RoleRecord): BootstrapResponse {
@@ -99,6 +110,44 @@ export async function startRoleGeneration(store: RoleStore, project: ProjectCont
   if (rotation) return { role: roleKey, status: "starting", started: false, rotation_id: rotation.id };
   const result = await rotateRoleGeneration(store, project, roleKey, "initial generation", options) as Record<string, unknown>;
   return { ...result, status: "active", started: true };
+}
+
+const AUTO_WAKE_TYPES = new Set(["ASSIGN", "VERIFY_REQUEST", "HANDOFF"]);
+
+export async function dispatchRoleMessage(store: RoleStore, project: ProjectContext, input: SendMessageInput, options: DispatchOptions = {}): Promise<unknown> {
+  const message = store.sendMessage(project, input);
+  const shouldWake = AUTO_WAKE_TYPES.has(input.type) && input.to_role !== "coordinator" && input.to_role !== "liaison";
+  if (!shouldWake) return { message, wake: { status: "not_required" } };
+
+  let generation = store.activeGeneration(project, input.to_role);
+  let startup: unknown = null;
+  if (!generation) {
+    startup = await startRoleGeneration(store, project, input.to_role, options.generationOptions);
+    generation = store.activeGeneration(project, input.to_role);
+  }
+  if (!generation) throw new Error(`ROLE_WAKE_TARGET_NOT_ACTIVE: role://${input.to_role}`);
+
+  if (!store.claimMessageWake(project, String(message.id))) {
+    const current = store.message(project, String(message.id));
+    return { message: current ?? message, startup, wake: { status: String(current?.wake_status || "already_claimed"), deduplicated: true } };
+  }
+
+  const client = options.clientFactory ? await options.clientFactory() : await AppServerClient.connect();
+  try {
+    const response = await client.runTurn(generation.thread_id, [
+      store.roleAnchor(project, input.to_role),
+      `A durable ${input.type} message has arrived from role://${input.from_role}. Process it now; this is an active work turn, not an anchor-only bootstrap.`,
+      "Read the authoritative typed inbox and task graph before acting. Acknowledge the message after consuming it.",
+      `Return RESULT, BLOCKED, or QUESTION through the typed role channel to role://${input.from_role}. Do not address the user directly.`,
+      `Dispatched message: ${JSON.stringify({ id: message.id, type: input.type, task_id: message.task_id, scope: message.scope, payload: input.payload })}`
+    ].join("\n\n"), options.timeoutMs);
+    const completed = store.finishMessageWake(project, String(message.id));
+    return { message: completed, startup, wake: { status: "completed", role: input.to_role, generation: generation.generation_number, response } };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    store.failMessageWake(project, String(message.id), reason);
+    throw new Error(`ROLE_WAKE_FAILED: role://${input.to_role}: ${reason}`);
+  } finally { client.close(); }
 }
 
 export async function dispatchLiaisonRequest(store: RoleStore, project: ProjectContext, input: { liaison_generation: number; request: string; task_id?: string; scope?: string; message_id?: string }): Promise<unknown> {

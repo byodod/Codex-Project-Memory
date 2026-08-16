@@ -6,7 +6,7 @@ import {
   BootstrapResponse, FactKind, GenerationRecord, MessageType,
   ProjectContext, RoleKind, RolePolicy, RoleRecord, RotationState
 } from "./types.js";
-import { compactText, matchesAny, newId, nowIso, parseJson, slug, stableHash, uniqueStrings } from "./util.js";
+import { compactText, matchesAny, newId, nowIso, parseJson, slug, stableHash, stableJson, uniqueStrings } from "./util.js";
 
 type Row = Record<string, unknown>;
 
@@ -149,6 +149,8 @@ export class RoleStore {
         scope TEXT NOT NULL DEFAULT '', architecture_epoch INTEGER NOT NULL, payload TEXT NOT NULL,
         evidence_refs TEXT NOT NULL DEFAULT '[]', reply_to TEXT REFERENCES messages(id),
         status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','delivered','acknowledged','rejected')),
+        wake_status TEXT NOT NULL DEFAULT 'idle' CHECK(wake_status IN ('idle','running','completed','failed')),
+        wake_error TEXT, wake_started_at TEXT, wake_completed_at TEXT,
         created_at TEXT NOT NULL, delivered_at TEXT, acknowledged_at TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_mailbox ON messages(to_role_id, status, created_at);
@@ -177,6 +179,15 @@ export class RoleStore {
       );
     `);
     this.migrateLegacyRoleFacts();
+    this.migrateMessageWakeState();
+  }
+
+  private migrateMessageWakeState(): void {
+    const columns = new Set((this.db.prepare("PRAGMA table_info(messages)").all() as Row[]).map((row) => String(row.name)));
+    if (!columns.has("wake_status")) this.db.exec("ALTER TABLE messages ADD COLUMN wake_status TEXT NOT NULL DEFAULT 'idle' CHECK(wake_status IN ('idle','running','completed','failed'))");
+    if (!columns.has("wake_error")) this.db.exec("ALTER TABLE messages ADD COLUMN wake_error TEXT");
+    if (!columns.has("wake_started_at")) this.db.exec("ALTER TABLE messages ADD COLUMN wake_started_at TEXT");
+    if (!columns.has("wake_completed_at")) this.db.exec("ALTER TABLE messages ADD COLUMN wake_completed_at TEXT");
   }
 
   private migrateLegacyRoleFacts(): void {
@@ -410,8 +421,16 @@ export class RoleStore {
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING`)
       .run(id, project.id, input.type, from.id, to.id, input.from_generation, input.task_id || null, compactText(input.scope, 2000),
         input.architecture_epoch, JSON.stringify(input.payload), JSON.stringify(uniqueStrings(input.evidence_refs)), input.reply_to || null, "pending", time);
-    return this.db.prepare(`SELECT m.*,fr.role_key from_role,tr.role_key to_role FROM messages m
+    const row = this.db.prepare(`SELECT m.*,fr.role_key from_role,tr.role_key to_role FROM messages m
       JOIN roles fr ON fr.id=m.from_role_id JOIN roles tr ON tr.id=m.to_role_id WHERE m.id=?`).get(id) as Row;
+    const conflicts = row.type !== input.type || row.from_role !== from.role_key || row.to_role !== to.role_key
+      || Number(row.from_generation) !== input.from_generation || Number(row.architecture_epoch) !== input.architecture_epoch
+      || String(row.task_id || "") !== String(input.task_id || "") || String(row.scope || "") !== compactText(input.scope, 2000)
+      || String(row.reply_to || "") !== String(input.reply_to || "")
+      || stableJson(parseJson(row.payload, null)) !== stableJson(input.payload)
+      || stableJson(parseJson(row.evidence_refs, [])) !== stableJson(uniqueStrings(input.evidence_refs));
+    if (conflicts) throw new Error("MESSAGE_ID_CONFLICT");
+    return row;
   }
 
   inbox(project: ProjectContext, roleKey: string, includeAcknowledged = false): Row[] {
@@ -431,6 +450,63 @@ export class RoleStore {
       .run(nowIso(), messageId, role.id);
     const row = this.db.prepare("SELECT * FROM messages WHERE id=? AND to_role_id=?").get(messageId, role.id) as Row | undefined;
     if (!row) throw new Error("MESSAGE_NOT_FOUND"); return row;
+  }
+
+  claimMessageWake(project: ProjectContext, messageId: string): Row | null {
+    this.ensureProject(project); const time = nowIso();
+    const claimed = this.db.prepare(`UPDATE messages SET wake_status='running',wake_error=NULL,wake_started_at=?,wake_completed_at=NULL
+      WHERE id=? AND project_id=? AND wake_status IN ('idle','failed')`).run(time, messageId, project.id);
+    if (Number(claimed.changes) === 0) return null;
+    return this.db.prepare("SELECT * FROM messages WHERE id=? AND project_id=?").get(messageId, project.id) as Row;
+  }
+
+  finishMessageWake(project: ProjectContext, messageId: string): Row {
+    this.db.prepare("UPDATE messages SET wake_status='completed',wake_error=NULL,wake_completed_at=? WHERE id=? AND project_id=?")
+      .run(nowIso(), messageId, project.id);
+    const row = this.db.prepare("SELECT * FROM messages WHERE id=? AND project_id=?").get(messageId, project.id) as Row | undefined;
+    if (!row) throw new Error("MESSAGE_NOT_FOUND"); return row;
+  }
+
+  failMessageWake(project: ProjectContext, messageId: string, error: string): Row {
+    this.db.prepare("UPDATE messages SET wake_status='failed',wake_error=?,wake_completed_at=? WHERE id=? AND project_id=?")
+      .run(compactText(error, 4000), nowIso(), messageId, project.id);
+    const row = this.db.prepare("SELECT * FROM messages WHERE id=? AND project_id=?").get(messageId, project.id) as Row | undefined;
+    if (!row) throw new Error("MESSAGE_NOT_FOUND"); return row;
+  }
+
+  message(project: ProjectContext, messageId: string): Row | null {
+    const row = this.db.prepare(`SELECT m.*,fr.role_key from_role,tr.role_key to_role FROM messages m
+      JOIN roles fr ON fr.id=m.from_role_id JOIN roles tr ON tr.id=m.to_role_id WHERE m.id=? AND m.project_id=?`)
+      .get(messageId, project.id) as Row | undefined;
+    return row ? { ...row, payload: parseJson(row.payload, {}), evidence_refs: parseJson(row.evidence_refs, []) } : null;
+  }
+
+  resetProject(project: ProjectContext): Record<string, unknown> {
+    const existing = this.db.prepare("SELECT id,root,name FROM projects WHERE id=?").get(project.id) as Row | undefined;
+    if (!existing) return { project_id: project.id, root: project.root, deleted: false, counts: {} };
+    const counts = {
+      roles: Number((this.db.prepare("SELECT count(*) n FROM roles WHERE project_id=?").get(project.id) as Row).n),
+      generations: Number((this.db.prepare("SELECT count(*) n FROM role_generations g JOIN roles r ON r.id=g.role_id WHERE r.project_id=?").get(project.id) as Row).n),
+      tasks: Number((this.db.prepare("SELECT count(*) n FROM tasks WHERE project_id=?").get(project.id) as Row).n),
+      messages: Number((this.db.prepare("SELECT count(*) n FROM messages WHERE project_id=?").get(project.id) as Row).n),
+      events: Number((this.db.prepare("SELECT count(*) n FROM events WHERE project_id=?").get(project.id) as Row).n)
+    };
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("DELETE FROM events WHERE project_id=?").run(project.id);
+      this.db.prepare("DELETE FROM messages WHERE project_id=?").run(project.id);
+      this.db.prepare("DELETE FROM change_envelopes WHERE task_id IN (SELECT id FROM tasks WHERE project_id=?)").run(project.id);
+      this.db.prepare("DELETE FROM task_dependencies WHERE task_id IN (SELECT id FROM tasks WHERE project_id=?) OR depends_on IN (SELECT id FROM tasks WHERE project_id=?)").run(project.id, project.id);
+      this.db.prepare("DELETE FROM tasks WHERE project_id=?").run(project.id);
+      this.db.prepare("DELETE FROM rotations WHERE role_id IN (SELECT id FROM roles WHERE project_id=?)").run(project.id);
+      this.db.prepare("DELETE FROM role_leases WHERE role_id IN (SELECT id FROM roles WHERE project_id=?)").run(project.id);
+      this.db.prepare("DELETE FROM role_facts WHERE role_id IN (SELECT id FROM roles WHERE project_id=?)").run(project.id);
+      this.db.prepare("DELETE FROM role_generations WHERE role_id IN (SELECT id FROM roles WHERE project_id=?)").run(project.id);
+      this.db.prepare("DELETE FROM roles WHERE project_id=?").run(project.id);
+      this.db.prepare("DELETE FROM projects WHERE id=?").run(project.id);
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return { project_id: project.id, root: existing.root, deleted: true, counts };
   }
 
   advanceArchitecture(project: ProjectContext, reason: string): Row {

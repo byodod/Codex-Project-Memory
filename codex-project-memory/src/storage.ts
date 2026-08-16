@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { mkdirSync } from "node:fs";
+import { join, resolve, sep } from "node:path";
+import { mkdirSync, rmSync } from "node:fs";
 import {
   Authority,
   MemoryKind,
@@ -569,6 +569,25 @@ export class MemoryStore {
       this.exportProject(project);
     }
     return { apply, exact_duplicates: duplicates, changed: apply ? duplicates.length : 0 };
+  }
+
+  resetProject(project: ProjectContext): Record<string, unknown> {
+    const existing = this.db.prepare("SELECT id,root,name FROM projects WHERE id=?").get(project.id) as SqlRow | undefined;
+    if (!existing) return { project_id: project.id, root: project.root, deleted: false, counts: {}, export_removed: false };
+    const counts = {
+      tasks: Number((this.db.prepare("SELECT count(*) n FROM tasks WHERE project_id=?").get(project.id) as SqlRow).n),
+      memories: Number((this.db.prepare("SELECT count(*) n FROM memories WHERE project_id=?").get(project.id) as SqlRow).n),
+      events: Number((this.db.prepare("SELECT count(*) n FROM events WHERE project_id=?").get(project.id) as SqlRow).n),
+      verifications: Number((this.db.prepare("SELECT count(*) n FROM verifications WHERE project_id=?").get(project.id) as SqlRow).n),
+      checkpoints: Number((this.db.prepare("SELECT count(*) n FROM checkpoints WHERE project_id=?").get(project.id) as SqlRow).n)
+    };
+    this.db.prepare("DELETE FROM projects WHERE id=?").run(project.id);
+
+    const projectsRoot = resolve(this.root, "projects");
+    const exportDirectory = resolve(projectsRoot, project.id);
+    if (!exportDirectory.startsWith(`${projectsRoot}${sep}`)) throw new Error("UNSAFE_PROJECT_EXPORT_PATH");
+    rmSync(exportDirectory, { recursive: true, force: true });
+    return { project_id: project.id, root: existing.root, deleted: true, counts, export_removed: true };
   }
 
   exportProject(project: ProjectContext): void {

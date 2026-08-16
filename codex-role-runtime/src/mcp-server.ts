@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { resolveProject } from "./project.js";
-import { dispatchLiaisonRequest, startRoleGeneration } from "./generation-service.js";
+import { dispatchLiaisonRequest, dispatchRoleMessage, startRoleGeneration } from "./generation-service.js";
 import { RoleStore } from "./store.js";
 import { initializeStandardTopology } from "./topology.js";
 import { FACT_KINDS, MESSAGE_TYPES, ROLE_KINDS } from "./types.js";
@@ -106,13 +106,13 @@ tool("task_graph", {
 }, ({ cwd }: any) => run(cwd, (store, project) => store.taskGraph(project)));
 
 tool("message_send", {
-  title: "Send typed role message", description: "Route an idempotent typed message to role:// identity. Reject stale generations and stale architecture epochs.",
+  title: "Send typed role message", description: "Route an idempotent typed message to role:// identity. ASSIGN, VERIFY_REQUEST, and HANDOFF automatically create and wake non-Coordinator recipient tasks; result traffic never recursively wakes a running Coordinator.",
   inputSchema: {
     cwd, message_id: z.string().optional(), type: z.enum(MESSAGE_TYPES), from_role: z.string(), to_role: z.string(),
     from_generation: z.number().int().positive(), task_id: z.string().optional(), scope: z.string().max(2000).optional(),
     architecture_epoch: z.number().int().positive(), payload: z.unknown(), evidence_refs: z.array(z.string()).max(100).optional(), reply_to: z.string().optional()
   }, annotations: { readOnlyHint: false, idempotentHint: true }
-}, ({ cwd, ...input }: any) => run(cwd, (store, project) => store.sendMessage(project, input)));
+}, ({ cwd, ...input }: any) => runAsync(cwd, (store, project) => dispatchRoleMessage(store, project, input)));
 
 tool("message_inbox", {
   title: "Read role mailbox", description: "Read typed messages addressed to a role and mark pending messages delivered.",

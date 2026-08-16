@@ -34,7 +34,7 @@ sh ./scripts/install.sh
 
 Then restart Codex and begin a new task. Plugin hooks are non-managed code: open `/hooks`, inspect them, and trust the current definitions. The plugin exposes `project_memory` and `role_runtime` MCP servers.
 
-To initialize the default role topology, send `初始化角色编排`. The integrated Hook binds the current task as `role://liaison` and deterministically starts `role://coordinator` before the Liaison model turn begins. Repeating the exact prompt from another task safely hands the Liaison generation off to that task and reuses the existing Coordinator.
+To initialize the default role topology, send `初始化角色编排`. The integrated Hook binds the current task as `role://liaison` and deterministically starts `role://coordinator` before the Liaison model turn begins. Repeating the exact prompt from another task safely hands the Liaison generation off to that task and reuses the existing Coordinator. When the Coordinator sends `ASSIGN`, `VERIFY_REQUEST`, or `HANDOFF`, Role Runtime now creates the target role task when needed and immediately wakes it to process the durable inbox. Stable message IDs prevent duplicate turns; failed wakes remain retryable, and result messages never recursively wake a Coordinator turn that is already running.
 
 ## Normal Codex workflow
 
@@ -71,6 +71,19 @@ Always pass the current repository directory as `cwd` when calling MCP tools.
 
 Role Runtime adds role definition/status, `role_start`, role facts, task graph, typed mailboxes, Liaison-to-Coordinator requests, change envelopes, architecture epochs, and atomic generation rotation. Project Memory remains the durable user-level completion contract; Role Runtime is the internal execution graph.
 
+## Reset one project completely
+
+The installed plugin includes a destructive, project-scoped reset command. It removes the resolved project's Project Memory tasks, memories, events, verifications, checkpoints and generated exports, plus all Role Runtime roles, generations, task graph, messages, rotations, events and change envelopes. Other projects are not touched.
+
+The command requires the same exact project root twice, so a mistyped `cwd` cannot be silently confirmed:
+
+```powershell
+$projectRoot = "E:\Github\4.6\Game-10"
+node --no-warnings "$env:USERPROFILE\plugins\codex-project-memory\dist\cli.mjs" reset-project --cwd $projectRoot --confirm-root $projectRoot
+```
+
+This cannot be undone from the plugin. Close or stop active role work first. Existing Codex tasks may remain visible in task history, but after reset they have no role authority or durable project state. Start a new Codex task and send `初始化角色编排` to rebuild the project from zero.
+
 ## Hook behavior
 
 | Hook | Behavior |
@@ -105,6 +118,7 @@ Inspect the current project without Codex:
 node --no-warnings .\dist\cli.mjs status --cwd C:\path\to\repo
 node --no-warnings .\dist\cli.mjs search SaveSystem --cwd C:\path\to\repo
 node --no-warnings .\dist\cli.mjs checkpoint --cwd C:\path\to\repo
+node --no-warnings .\dist\cli.mjs reset-project --cwd C:\path\to\repo --confirm-root C:\path\to\repo
 ```
 
 `MEMORY.md` is an inspectable projection. SQLite is the machine source of truth. See [architecture](./docs/architecture.md), [data model](./docs/data-model.md), and [security](./SECURITY.md).

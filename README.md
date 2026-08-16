@@ -22,7 +22,16 @@ npm test
 
 安装脚本会同时打包 Role Runtime，移除重复的独立角色插件安装，并保留已有角色数据库。Project Memory 保存用户级目标、决策、失败与验证证据；Role Runtime 保存内部角色身份、路由、任务图与 Generation 生命周期。
 
-安装并重启 Codex 后，在项目的新任务中只需发送 `初始化角色编排`。当前任务会成为用户联络者，内部协调者由插件启动；之后用户始终通过这个联络者沟通。
+安装并重启 Codex 后，在项目的新任务中只需发送 `初始化角色编排`。当前任务会成为用户联络者，内部协调者由插件启动；协调者发出任务消息时会自动创建并唤醒目标角色任务，之后用户始终通过这个联络者沟通。
+
+需要让某个项目彻底从零开始时，可执行以下破坏性命令。它只清除两次明确指定的同一项目根目录所对应的全部项目记忆、导出文件、角色、Generation、任务图、消息、轮换和事件；其他项目不受影响：
+
+```powershell
+$projectRoot = "E:\Github\4.6\Game-10"
+node --no-warnings "$env:USERPROFILE\plugins\codex-project-memory\dist\cli.mjs" reset-project --cwd $projectRoot --confirm-root $projectRoot
+```
+
+清除不可由插件撤销。完成后新建 Codex 任务，再发送 `初始化角色编排`。
 
 ## 参考与致谢
 

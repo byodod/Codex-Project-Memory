@@ -41,7 +41,7 @@ If custom initialization is required, use `project_initialize`, `project_configu
 ## Orchestrate work
 
 1. Keep the Liaison user-focused and the Coordinator compact. The Liaison uses `liaison_request`; the Coordinator uses `task_upsert` and `task_graph`, storing pointers and blockers rather than all module knowledge.
-2. Route decisions through the semantic owner. Use `message_send` with a typed message and the sender's active generation plus current architecture epoch.
+2. Route decisions through the semantic owner. Use `message_send` with a typed message and the sender's active generation plus current architecture epoch. `ASSIGN`, `VERIFY_REQUEST`, and `HANDOFF` automatically create and wake a non-Coordinator recipient task. Reuse a stable `message_id`: completed dispatches deduplicate, while failed wakes can retry. Result traffic back to the Coordinator is mailbox-only so it cannot start a competing Coordinator turn.
 3. Read a role's work with `message_inbox`; acknowledge consumed messages with `message_ack`.
 4. Give a writable worker a `change_envelope_create` packet: intent, allowed scope regexes, symbols, constraints, non-goals, and tests.
 5. Compare actual changed paths with `change_envelope_check` before accepting the result.

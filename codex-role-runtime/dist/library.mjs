@@ -228,6 +228,8 @@ var RoleStore = class {
         scope TEXT NOT NULL DEFAULT '', architecture_epoch INTEGER NOT NULL, payload TEXT NOT NULL,
         evidence_refs TEXT NOT NULL DEFAULT '[]', reply_to TEXT REFERENCES messages(id),
         status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','delivered','acknowledged','rejected')),
+        wake_status TEXT NOT NULL DEFAULT 'idle' CHECK(wake_status IN ('idle','running','completed','failed')),
+        wake_error TEXT, wake_started_at TEXT, wake_completed_at TEXT,
         created_at TEXT NOT NULL, delivered_at TEXT, acknowledged_at TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_mailbox ON messages(to_role_id, status, created_at);
@@ -256,6 +258,14 @@ var RoleStore = class {
       );
     `);
     this.migrateLegacyRoleFacts();
+    this.migrateMessageWakeState();
+  }
+  migrateMessageWakeState() {
+    const columns = new Set(this.db.prepare("PRAGMA table_info(messages)").all().map((row) => String(row.name)));
+    if (!columns.has("wake_status")) this.db.exec("ALTER TABLE messages ADD COLUMN wake_status TEXT NOT NULL DEFAULT 'idle' CHECK(wake_status IN ('idle','running','completed','failed'))");
+    if (!columns.has("wake_error")) this.db.exec("ALTER TABLE messages ADD COLUMN wake_error TEXT");
+    if (!columns.has("wake_started_at")) this.db.exec("ALTER TABLE messages ADD COLUMN wake_started_at TEXT");
+    if (!columns.has("wake_completed_at")) this.db.exec("ALTER TABLE messages ADD COLUMN wake_completed_at TEXT");
   }
   migrateLegacyRoleFacts() {
     const row = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='role_facts'").get();
@@ -548,8 +558,11 @@ var RoleStore = class {
       "pending",
       time
     );
-    return this.db.prepare(`SELECT m.*,fr.role_key from_role,tr.role_key to_role FROM messages m
+    const row = this.db.prepare(`SELECT m.*,fr.role_key from_role,tr.role_key to_role FROM messages m
       JOIN roles fr ON fr.id=m.from_role_id JOIN roles tr ON tr.id=m.to_role_id WHERE m.id=?`).get(id);
+    const conflicts = row.type !== input.type || row.from_role !== from.role_key || row.to_role !== to.role_key || Number(row.from_generation) !== input.from_generation || Number(row.architecture_epoch) !== input.architecture_epoch || String(row.task_id || "") !== String(input.task_id || "") || String(row.scope || "") !== compactText(input.scope, 2e3) || String(row.reply_to || "") !== String(input.reply_to || "") || stableJson(parseJson(row.payload, null)) !== stableJson(input.payload) || stableJson(parseJson(row.evidence_refs, [])) !== stableJson(uniqueStrings(input.evidence_refs));
+    if (conflicts) throw new Error("MESSAGE_ID_CONFLICT");
+    return row;
   }
   inbox(project, roleKey, includeAcknowledged = false) {
     const role = this.getRole(project, roleKey);
@@ -569,6 +582,61 @@ var RoleStore = class {
     const row = this.db.prepare("SELECT * FROM messages WHERE id=? AND to_role_id=?").get(messageId, role.id);
     if (!row) throw new Error("MESSAGE_NOT_FOUND");
     return row;
+  }
+  claimMessageWake(project, messageId) {
+    this.ensureProject(project);
+    const time = nowIso();
+    const claimed = this.db.prepare(`UPDATE messages SET wake_status='running',wake_error=NULL,wake_started_at=?,wake_completed_at=NULL
+      WHERE id=? AND project_id=? AND wake_status IN ('idle','failed')`).run(time, messageId, project.id);
+    if (Number(claimed.changes) === 0) return null;
+    return this.db.prepare("SELECT * FROM messages WHERE id=? AND project_id=?").get(messageId, project.id);
+  }
+  finishMessageWake(project, messageId) {
+    this.db.prepare("UPDATE messages SET wake_status='completed',wake_error=NULL,wake_completed_at=? WHERE id=? AND project_id=?").run(nowIso(), messageId, project.id);
+    const row = this.db.prepare("SELECT * FROM messages WHERE id=? AND project_id=?").get(messageId, project.id);
+    if (!row) throw new Error("MESSAGE_NOT_FOUND");
+    return row;
+  }
+  failMessageWake(project, messageId, error) {
+    this.db.prepare("UPDATE messages SET wake_status='failed',wake_error=?,wake_completed_at=? WHERE id=? AND project_id=?").run(compactText(error, 4e3), nowIso(), messageId, project.id);
+    const row = this.db.prepare("SELECT * FROM messages WHERE id=? AND project_id=?").get(messageId, project.id);
+    if (!row) throw new Error("MESSAGE_NOT_FOUND");
+    return row;
+  }
+  message(project, messageId) {
+    const row = this.db.prepare(`SELECT m.*,fr.role_key from_role,tr.role_key to_role FROM messages m
+      JOIN roles fr ON fr.id=m.from_role_id JOIN roles tr ON tr.id=m.to_role_id WHERE m.id=? AND m.project_id=?`).get(messageId, project.id);
+    return row ? { ...row, payload: parseJson(row.payload, {}), evidence_refs: parseJson(row.evidence_refs, []) } : null;
+  }
+  resetProject(project) {
+    const existing = this.db.prepare("SELECT id,root,name FROM projects WHERE id=?").get(project.id);
+    if (!existing) return { project_id: project.id, root: project.root, deleted: false, counts: {} };
+    const counts = {
+      roles: Number(this.db.prepare("SELECT count(*) n FROM roles WHERE project_id=?").get(project.id).n),
+      generations: Number(this.db.prepare("SELECT count(*) n FROM role_generations g JOIN roles r ON r.id=g.role_id WHERE r.project_id=?").get(project.id).n),
+      tasks: Number(this.db.prepare("SELECT count(*) n FROM tasks WHERE project_id=?").get(project.id).n),
+      messages: Number(this.db.prepare("SELECT count(*) n FROM messages WHERE project_id=?").get(project.id).n),
+      events: Number(this.db.prepare("SELECT count(*) n FROM events WHERE project_id=?").get(project.id).n)
+    };
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("DELETE FROM events WHERE project_id=?").run(project.id);
+      this.db.prepare("DELETE FROM messages WHERE project_id=?").run(project.id);
+      this.db.prepare("DELETE FROM change_envelopes WHERE task_id IN (SELECT id FROM tasks WHERE project_id=?)").run(project.id);
+      this.db.prepare("DELETE FROM task_dependencies WHERE task_id IN (SELECT id FROM tasks WHERE project_id=?) OR depends_on IN (SELECT id FROM tasks WHERE project_id=?)").run(project.id, project.id);
+      this.db.prepare("DELETE FROM tasks WHERE project_id=?").run(project.id);
+      this.db.prepare("DELETE FROM rotations WHERE role_id IN (SELECT id FROM roles WHERE project_id=?)").run(project.id);
+      this.db.prepare("DELETE FROM role_leases WHERE role_id IN (SELECT id FROM roles WHERE project_id=?)").run(project.id);
+      this.db.prepare("DELETE FROM role_facts WHERE role_id IN (SELECT id FROM roles WHERE project_id=?)").run(project.id);
+      this.db.prepare("DELETE FROM role_generations WHERE role_id IN (SELECT id FROM roles WHERE project_id=?)").run(project.id);
+      this.db.prepare("DELETE FROM roles WHERE project_id=?").run(project.id);
+      this.db.prepare("DELETE FROM projects WHERE id=?").run(project.id);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    return { project_id: project.id, root: existing.root, deleted: true, counts };
   }
   advanceArchitecture(project, reason) {
     this.ensureProject(project);
@@ -1025,6 +1093,41 @@ async function startRoleGeneration(store, project, roleKey, options = {}) {
   const result = await rotateRoleGeneration(store, project, roleKey, "initial generation", options);
   return { ...result, status: "active", started: true };
 }
+var AUTO_WAKE_TYPES = /* @__PURE__ */ new Set(["ASSIGN", "VERIFY_REQUEST", "HANDOFF"]);
+async function dispatchRoleMessage(store, project, input, options = {}) {
+  const message = store.sendMessage(project, input);
+  const shouldWake = AUTO_WAKE_TYPES.has(input.type) && input.to_role !== "coordinator" && input.to_role !== "liaison";
+  if (!shouldWake) return { message, wake: { status: "not_required" } };
+  let generation = store.activeGeneration(project, input.to_role);
+  let startup = null;
+  if (!generation) {
+    startup = await startRoleGeneration(store, project, input.to_role, options.generationOptions);
+    generation = store.activeGeneration(project, input.to_role);
+  }
+  if (!generation) throw new Error(`ROLE_WAKE_TARGET_NOT_ACTIVE: role://${input.to_role}`);
+  if (!store.claimMessageWake(project, String(message.id))) {
+    const current = store.message(project, String(message.id));
+    return { message: current ?? message, startup, wake: { status: String(current?.wake_status || "already_claimed"), deduplicated: true } };
+  }
+  const client = options.clientFactory ? await options.clientFactory() : await AppServerClient.connect();
+  try {
+    const response = await client.runTurn(generation.thread_id, [
+      store.roleAnchor(project, input.to_role),
+      `A durable ${input.type} message has arrived from role://${input.from_role}. Process it now; this is an active work turn, not an anchor-only bootstrap.`,
+      "Read the authoritative typed inbox and task graph before acting. Acknowledge the message after consuming it.",
+      `Return RESULT, BLOCKED, or QUESTION through the typed role channel to role://${input.from_role}. Do not address the user directly.`,
+      `Dispatched message: ${JSON.stringify({ id: message.id, type: input.type, task_id: message.task_id, scope: message.scope, payload: input.payload })}`
+    ].join("\n\n"), options.timeoutMs);
+    const completed = store.finishMessageWake(project, String(message.id));
+    return { message: completed, startup, wake: { status: "completed", role: input.to_role, generation: generation.generation_number, response } };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    store.failMessageWake(project, String(message.id), reason);
+    throw new Error(`ROLE_WAKE_FAILED: role://${input.to_role}: ${reason}`);
+  } finally {
+    client.close();
+  }
+}
 async function dispatchLiaisonRequest(store, project, input) {
   const liaison = store.getRole(project, "liaison");
   const coordinator = store.getRole(project, "coordinator");
@@ -1082,6 +1185,7 @@ export {
   STANDARD_ROLES,
   compactText,
   dispatchLiaisonRequest,
+  dispatchRoleMessage,
   expectedBootstrap,
   handoffRoleGenerationToThread,
   initializeStandardTopology,
