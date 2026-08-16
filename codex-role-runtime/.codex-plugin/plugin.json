@@ -1,0 +1,37 @@
+{
+  "name": "codex-role-runtime",
+  "version": "1.0.0+codex.20260816193546",
+  "description": "One-prompt role orchestration with a user-facing Liaison, persistent roles, typed routing, and replaceable Codex task generations.",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Role Runtime",
+    "shortDescription": "User Liaison and persistent role orchestration",
+    "longDescription": "Creates a user-facing Liaison and internal Coordinator from one prompt, then keeps role identity, ownership, task state, typed messages, and policy outside model context while Codex tasks rotate safely.",
+    "developerName": "Local developer",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "\u521d\u59cb\u5316\u89d2\u8272\u7f16\u6392",
+      "Show active role generations, health, messages, and blockers.",
+      "Prepare a safe session rotation for the Architect role."
+    ],
+    "brandColor": "#4338CA"
+  },
+  "mcpServers": "./.mcp.json",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "roles",
+    "orchestration",
+    "threads",
+    "sqlite",
+    "mcp",
+    "hooks"
+  ]
+}

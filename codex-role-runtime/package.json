@@ -1,0 +1,24 @@
+{
+  "name": "codex-role-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Persistent Role / Disposable Session runtime for Codex",
+  "engines": { "node": ">=22.5.0" },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run typecheck && npm run build && node --no-warnings --test tests/*.test.mjs",
+    "doctor": "npm run build && node --no-warnings dist/cli.mjs doctor",
+    "pack:check": "npm run build && node --no-warnings scripts/check-package.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "26.2.0",
+    "esbuild": "0.28.2",
+    "typescript": "7.0.2"
+  }
+}

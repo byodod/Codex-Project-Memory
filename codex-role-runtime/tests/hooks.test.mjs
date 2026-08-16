@@ -1,0 +1,104 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import { RoleStore, resolveProject } from "../dist/library.mjs";
+
+const hook = resolve("dist/hook.mjs");
+function invoke(cwd, data, input) {
+  const run = spawnSync(process.execPath, ["--no-warnings", hook], { cwd, env: { ...process.env, CODEX_ROLE_RUNTIME_HOME: data }, input: JSON.stringify(input), encoding: "utf8" });
+  assert.equal(run.status, 0, run.stderr); return run.stdout.trim() ? JSON.parse(run.stdout) : {};
+}
+
+test("one prompt initializes the standard topology and binds this task as the user liaison", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "codex-role-init-project-")); const data = mkdtempSync(join(tmpdir(), "codex-role-init-data-"));
+
+  const initialized = invoke(cwd, data, { session_id: "thr-user", turn_id: "t0", cwd, hook_event_name: "UserPromptSubmit", prompt: "初始化角色编排" });
+  assert.match(initialized.hookSpecificOutput.additionalContext, /role:\/\/liaison/);
+  assert.match(initialized.hookSpecificOutput.additionalContext, /communication entry point/);
+  assert.match(initialized.hookSpecificOutput.additionalContext, /Codex desktop task tools/);
+
+  const repeated = invoke(cwd, data, { session_id: "thr-user", turn_id: "t1", cwd, hook_event_name: "UserPromptSubmit", prompt: "初始化角色编排。" });
+  assert.match(repeated.hookSpecificOutput.additionalContext, /role:\/\/liaison/);
+
+  const store = new RoleStore(data); const project = resolveProject(cwd);
+  assert.deepEqual(store.listRoles(project).map((role) => role.role_key).sort(), ["architect", "coordinator", "liaison", "verifier"]);
+  assert.equal(store.activeGeneration(project, "liaison").thread_id, "thr-user");
+  assert.equal(store.activeGeneration(project, "coordinator"), null);
+  assert.equal(store.db.prepare("SELECT count(*) n FROM role_generations").get().n, 1);
+  store.close();
+
+  const duplicate = invoke(cwd, data, { session_id: "thr-other", turn_id: "t0", cwd, hook_event_name: "UserPromptSubmit", prompt: "initialize role orchestration" });
+  assert.match(duplicate.hookSpecificOutput.additionalContext, /resumed and handed off/);
+  const afterHandoff = new RoleStore(data); const handedOffProject = resolveProject(cwd);
+  assert.equal(afterHandoff.activeGeneration(handedOffProject, "liaison").thread_id, "thr-other");
+  assert.equal(afterHandoff.activeGeneration(handedOffProject, "liaison").generation_number, 2);
+  assert.equal(afterHandoff.activeGeneration(handedOffProject, "coordinator"), null);
+  assert.equal(afterHandoff.db.prepare("SELECT count(*) n FROM role_generations WHERE status='active'").get().n, 1);
+  afterHandoff.close();
+  const staleLiaison = invoke(cwd, data, { session_id: "thr-user", turn_id: "t2", cwd, hook_event_name: "UserPromptSubmit", prompt: "continue" });
+  assert.equal(staleLiaison.decision, "block");
+  assert.match(staleLiaison.reason, /STALE_GENERATION/);
+});
+
+test("ordinary prompts do not initialize or bind a role", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "codex-role-ordinary-project-")); const data = mkdtempSync(join(tmpdir(), "codex-role-ordinary-data-"));
+  assert.deepEqual(invoke(cwd, data, { session_id: "thr-user", turn_id: "t0", cwd, hook_event_name: "UserPromptSubmit", prompt: "请分析一下角色编排方案" }), {});
+  const store = new RoleStore(data); const project = resolveProject(cwd);
+  assert.equal(store.listRoles(project).length, 0);
+  assert.equal(store.getGenerationByThread(project, "thr-user"), null);
+  store.close();
+});
+
+test("hook claims role, injects anchor, enforces read-only policy, and counts compact idempotently", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "codex-role-hook-project-")); const data = mkdtempSync(join(tmpdir(), "codex-role-hook-data-"));
+  const store = new RoleStore(data); const project = resolveProject(cwd);
+  store.defineRole(project, { role_key: "architect", mission: "Protect boundaries.", owned_domains: ["architecture"], policy: { mode: "read_only" } }); store.close();
+
+  const claim = invoke(cwd, data, { session_id: "thr-a", turn_id: "t0", cwd, hook_event_name: "UserPromptSubmit", prompt: "role://bind architect" });
+  assert.match(claim.hookSpecificOutput.additionalContext, /role:\/\/architect/);
+  const start = invoke(cwd, data, { session_id: "thr-a", cwd, hook_event_name: "SessionStart", source: "resume" });
+  assert.match(start.hookSpecificOutput.additionalContext, /Protect boundaries/);
+  const denied = invoke(cwd, data, { session_id: "thr-a", turn_id: "t1", tool_use_id: "u1", cwd, hook_event_name: "PreToolUse", tool_name: "apply_patch", tool_input: { command: "*** Begin Patch" } });
+  assert.equal(denied.hookSpecificOutput.permissionDecision, "deny");
+  const shellDenied = invoke(cwd, data, { session_id: "thr-a", turn_id: "t1", tool_use_id: "u2", cwd, hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "Remove-Item file.txt" } });
+  assert.equal(shellDenied.hookSpecificOutput.permissionDecision, "deny");
+  const shellRead = invoke(cwd, data, { session_id: "thr-a", turn_id: "t1", tool_use_id: "u3", cwd, hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "git status --short" } });
+  assert.notEqual(shellRead.hookSpecificOutput?.permissionDecision, "deny");
+
+  invoke(cwd, data, { session_id: "thr-a", turn_id: "c1", cwd, hook_event_name: "PostCompact", trigger: "auto" });
+  invoke(cwd, data, { session_id: "thr-a", turn_id: "c1", cwd, hook_event_name: "PostCompact", trigger: "auto" });
+  let check = new RoleStore(data); assert.equal(check.activeGeneration(project, "architect").compact_count, 1); check.close();
+  invoke(cwd, data, { session_id: "thr-a", turn_id: "c2", cwd, hook_event_name: "PostCompact", trigger: "auto" });
+  check = new RoleStore(data); assert.equal(check.activeGeneration(project, "architect").health, "rotation_required"); check.close();
+});
+
+test("retired generation prompt and tool calls are blocked", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "codex-role-stale-project-")); const data = mkdtempSync(join(tmpdir(), "codex-role-stale-data-"));
+  const store = new RoleStore(data); const project = resolveProject(cwd);
+  store.defineRole(project, { role_key: "owner", mission: "Own domain.", policy: { mode: "workspace_write" } });
+  store.bindInitial(project, "owner", "thr-old"); const candidate = store.createCandidate(project, "owner", "thr-new");
+  store.activateCandidate(project, "owner", candidate.id, "rotate"); store.close();
+  const prompt = invoke(cwd, data, { session_id: "thr-old", turn_id: "t1", cwd, hook_event_name: "UserPromptSubmit", prompt: "continue" });
+  assert.equal(prompt.decision, "block"); assert.match(prompt.reason, /STALE_GENERATION/);
+  const tool = invoke(cwd, data, { session_id: "thr-old", turn_id: "t1", tool_use_id: "u1", cwd, hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "echo hi" } });
+  assert.equal(tool.hookSpecificOutput.permissionDecision, "deny");
+});
+
+test("bootstrapping generation receives context but cannot recurse or use tools before cutover", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "codex-role-bootstrap-project-")); const data = mkdtempSync(join(tmpdir(), "codex-role-bootstrap-data-"));
+  const store = new RoleStore(data); const project = resolveProject(cwd);
+  store.defineRole(project, { role_key: "coordinator", mission: "Coordinate work.", policy: { mode: "read_only" } });
+  store.createCandidate(project, "coordinator", "thr-candidate"); store.close();
+
+  const start = invoke(cwd, data, { session_id: "thr-candidate", cwd, hook_event_name: "SessionStart", source: "startup" });
+  assert.match(start.hookSpecificOutput.additionalContext, /bootstrap candidate/i);
+  assert.match(start.hookSpecificOutput.additionalContext, /Generation: 1 \(bootstrapping\)/);
+  const prompt = invoke(cwd, data, { session_id: "thr-candidate", turn_id: "t1", cwd, hook_event_name: "UserPromptSubmit", prompt: "初始化角色编排" });
+  assert.equal(prompt.decision, "block"); assert.match(prompt.reason, /BOOTSTRAPPING_GENERATION/);
+  const tool = invoke(cwd, data, { session_id: "thr-candidate", turn_id: "t1", tool_use_id: "u1", cwd, hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "git status --short" } });
+  assert.equal(tool.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(tool.hookSpecificOutput.permissionDecisionReason, /BOOTSTRAPPING_GENERATION/);
+});

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Reset Project Runtime"
+  short_description: "Clear this project memory and role runtime"
+  default_prompt: "Use $reset-project to completely clear the current project memory and role runtime."
+policy:
+  allow_implicit_invocation: false

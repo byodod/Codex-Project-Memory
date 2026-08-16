@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 import { MemoryStore, resolveProject } from "../dist/library.mjs";
 
 const hookPath = resolve("dist/hook.mjs");
+const integratedHookPath = resolve("dist/integrated-hook.mjs");
 
 function invoke(input, dataHome, cwd) {
   const run = spawnSync(process.execPath, ["--no-warnings", hookPath], {
@@ -54,4 +55,37 @@ test("hooks rehydrate, recall, checkpoint, redact secrets, and gate incomplete t
   check.close();
   const allowed = invoke({ session_id: "s1", turn_id: "t2", cwd, hook_event_name: "Stop", stop_hook_active: false }, data, cwd);
   assert.deepEqual(allowed, {});
+});
+
+test("integrated Hook merges project memory with role initialization and policy", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "codex-integrated-hook-project-"));
+  const memoryData = mkdtempSync(join(tmpdir(), "codex-integrated-memory-data-"));
+  const roleData = mkdtempSync(join(tmpdir(), "codex-integrated-role-data-"));
+  const memory = new MemoryStore(memoryData); const project = resolveProject(cwd);
+  const task = memory.upsertTask(project, { title: "Integrated task", goal: "Prove both control planes", next_steps: ["continue"] });
+  memory.storeMemory(project, { task_id: task.id, kind: "constraint", summary: "Protected boundary", content: "Do not edit generated files", authority: "project_authority", importance: 1 });
+  memory.close();
+
+  const env = { ...process.env, CODEX_PROJECT_MEMORY_HOME: memoryData, CODEX_ROLE_RUNTIME_HOME: roleData };
+  const invokeIntegrated = (input) => {
+    const run = spawnSync(process.execPath, ["--no-warnings", integratedHookPath], { cwd, env, input: JSON.stringify(input), encoding: "utf8" });
+    assert.equal(run.status, 0, run.stderr); return run.stdout.trim() ? JSON.parse(run.stdout) : {};
+  };
+  const initialized = invokeIntegrated({ session_id: "thr-integrated-user", turn_id: "t0", cwd, hook_event_name: "UserPromptSubmit", prompt: "初始化角色编排" });
+  assert.match(initialized.hookSpecificOutput.additionalContext, /communication entry point/);
+  assert.match(initialized.hookSpecificOutput.additionalContext, /Codex desktop task tools/);
+  const handedOff = invokeIntegrated({ session_id: "thr-integrated-user-2", turn_id: "t0", cwd, hook_event_name: "UserPromptSubmit", prompt: "启动角色编排" });
+  assert.match(handedOff.hookSpecificOutput.additionalContext, /resumed and handed off/);
+  const resumed = invokeIntegrated({ session_id: "thr-integrated-user", cwd, hook_event_name: "SessionStart", source: "resume" });
+  assert.equal(resumed.continue, false);
+  assert.match(resumed.stopReason, /STALE_GENERATION/);
+  const current = invokeIntegrated({ session_id: "thr-integrated-user-2", cwd, hook_event_name: "SessionStart", source: "resume" });
+  assert.match(current.hookSpecificOutput.additionalContext, /Integrated task/);
+  assert.match(current.hookSpecificOutput.additionalContext, /role:\/\/liaison/);
+
+  const roleStore = new (await import("../dist/role-library.mjs")).RoleStore(roleData);
+  const roleProject = (await import("../dist/role-library.mjs")).resolveProject(cwd);
+  assert.equal(roleStore.activeGeneration(roleProject, "coordinator"), null);
+  assert.equal(roleStore.activeGeneration(roleProject, "liaison").thread_id, "thr-integrated-user-2");
+  roleStore.close();
 });

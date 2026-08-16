@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { mkdirSync } from "node:fs";
+import { join, resolve, sep } from "node:path";
+import { mkdirSync, rmSync } from "node:fs";
 import {
   Authority,
   MemoryKind,
@@ -69,7 +69,8 @@ export interface EventInput {
 }
 
 function dataRoot(explicit?: string): string {
-  return explicit || process.env.PLUGIN_DATA || process.env.CODEX_PROJECT_MEMORY_HOME || join(homedir(), ".codex-project-memory");
+  const codexHome = process.env.CODEX_HOME || join(homedir(), ".codex");
+  return explicit || process.env.CODEX_PROJECT_MEMORY_HOME || process.env.PLUGIN_DATA || join(codexHome, "plugin-data", "codex-project-memory");
 }
 
 function taskFromRow(row?: SqlRow): TaskRecord | null {
@@ -94,7 +95,8 @@ function memoryFromRow(row: SqlRow): MemoryRecord {
     importance: Number(row.importance),
     recall_count: Number(row.recall_count),
     tags: safeJsonParse(row.tags, []),
-    score: row.score === undefined ? undefined : Number(row.score)
+    score: row.score === undefined ? undefined : Number(row.score),
+    rank: row.rank === undefined ? undefined : Number(row.rank)
   };
 }
 
@@ -433,12 +435,14 @@ export class MemoryStore {
       if (options.taskId && memory.task_id === options.taskId) score += 2;
       if (["user_decision", "project_authority"].includes(memory.authority)) score += 1.5;
       if (memory.kind === "failure") score += 0.5;
+      if (memory.rank !== undefined && memory.rank < 0) score += Math.min(8, -memory.rank);
       return { ...memory, score };
     }).sort((a, b) => (b.score ?? 0) - (a.score ?? 0)).slice(0, limit);
     if (scored.length) {
       const timestamp = nowIso();
       const update = this.db.prepare("UPDATE memories SET recall_count=recall_count+1,last_recalled_at=? WHERE id=?");
       for (const memory of scored) update.run(timestamp, memory.id);
+      return scored.map((memory) => ({ ...memory, recall_count: memory.recall_count + 1, last_recalled_at: timestamp }));
     }
     return scored;
   }
@@ -565,6 +569,25 @@ export class MemoryStore {
       this.exportProject(project);
     }
     return { apply, exact_duplicates: duplicates, changed: apply ? duplicates.length : 0 };
+  }
+
+  resetProject(project: ProjectContext): Record<string, unknown> {
+    const existing = this.db.prepare("SELECT id,root,name FROM projects WHERE id=?").get(project.id) as SqlRow | undefined;
+    if (!existing) return { project_id: project.id, root: project.root, deleted: false, counts: {}, export_removed: false };
+    const counts = {
+      tasks: Number((this.db.prepare("SELECT count(*) n FROM tasks WHERE project_id=?").get(project.id) as SqlRow).n),
+      memories: Number((this.db.prepare("SELECT count(*) n FROM memories WHERE project_id=?").get(project.id) as SqlRow).n),
+      events: Number((this.db.prepare("SELECT count(*) n FROM events WHERE project_id=?").get(project.id) as SqlRow).n),
+      verifications: Number((this.db.prepare("SELECT count(*) n FROM verifications WHERE project_id=?").get(project.id) as SqlRow).n),
+      checkpoints: Number((this.db.prepare("SELECT count(*) n FROM checkpoints WHERE project_id=?").get(project.id) as SqlRow).n)
+    };
+    this.db.prepare("DELETE FROM projects WHERE id=?").run(project.id);
+
+    const projectsRoot = resolve(this.root, "projects");
+    const exportDirectory = resolve(projectsRoot, project.id);
+    if (!exportDirectory.startsWith(`${projectsRoot}${sep}`)) throw new Error("UNSAFE_PROJECT_EXPORT_PATH");
+    rmSync(exportDirectory, { recursive: true, force: true });
+    return { project_id: project.id, root: existing.root, deleted: true, counts, export_removed: true };
   }
 
   exportProject(project: ProjectContext): void {

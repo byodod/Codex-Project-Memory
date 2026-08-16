@@ -1,89 +1,85 @@
 {
-  "description": "Project Memory lifecycle capture, recall, compaction checkpoint, and completion gate.",
+  "description": "Integrated project memory, one-prompt Liaison/Coordinator initialization, role policy, recall, checkpoints, and completion gates.",
   "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "startup|resume|compact",
-        "hooks": [{
-          "type": "command",
-          "command": "node --no-warnings \"${PLUGIN_ROOT}/dist/hook.mjs\"",
-          "commandWindows": "node --no-warnings \"%PLUGIN_ROOT%\\dist\\hook.mjs\"",
-          "statusMessage": "Restoring project memory",
-          "additionalContextLimit": 6000,
-          "timeout": 10
-        }]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [{
-          "type": "command",
-          "command": "node --no-warnings \"${PLUGIN_ROOT}/dist/hook.mjs\"",
-          "commandWindows": "node --no-warnings \"%PLUGIN_ROOT%\\dist\\hook.mjs\"",
-          "statusMessage": "Recalling project context",
-          "additionalContextLimit": 5000,
-          "timeout": 10
-        }]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "Bash|apply_patch|Edit|Write",
-        "hooks": [{
-          "type": "command",
-          "command": "node --no-warnings \"${PLUGIN_ROOT}/dist/hook.mjs\"",
-          "commandWindows": "node --no-warnings \"%PLUGIN_ROOT%\\dist\\hook.mjs\"",
-          "statusMessage": "Checking relevant project memory",
-          "additionalContextLimit": 4000,
-          "timeout": 10
-        }]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Bash|apply_patch|Edit|Write",
-        "hooks": [{
-          "type": "command",
-          "command": "node --no-warnings \"${PLUGIN_ROOT}/dist/hook.mjs\"",
-          "commandWindows": "node --no-warnings \"%PLUGIN_ROOT%\\dist\\hook.mjs\"",
-          "statusMessage": "Recording tool evidence",
-          "timeout": 10
-        }]
-      }
-    ],
-    "PreCompact": [
-      {
-        "matcher": "manual|auto",
-        "hooks": [{
-          "type": "command",
-          "command": "node --no-warnings \"${PLUGIN_ROOT}/dist/hook.mjs\"",
-          "commandWindows": "node --no-warnings \"%PLUGIN_ROOT%\\dist\\hook.mjs\"",
-          "statusMessage": "Checkpointing project memory",
-          "timeout": 10
-        }]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [{
-          "type": "command",
-          "command": "node --no-warnings \"${PLUGIN_ROOT}/dist/hook.mjs\"",
-          "commandWindows": "node --no-warnings \"%PLUGIN_ROOT%\\dist\\hook.mjs\"",
-          "statusMessage": "Checking task completion",
-          "timeout": 10
-        }]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [{
-          "type": "command",
-          "command": "node --no-warnings \"${PLUGIN_ROOT}/dist/hook.mjs\"",
-          "commandWindows": "node --no-warnings \"%PLUGIN_ROOT%\\dist\\hook.mjs\"",
-          "statusMessage": "Exporting project memory",
-          "timeout": 3
-        }]
-      }
-    ]
+    "SessionStart": [{
+      "matcher": "startup|resume|clear|compact",
+      "hooks": [{
+        "type": "command",
+        "command": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','integrated-hook.mjs')).href)\"",
+        "commandWindows": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','integrated-hook.mjs')).href)\"",
+        "statusMessage": "Restoring project memory and persistent role",
+        "additionalContextLimit": 10000,
+        "timeout": 20
+      }]
+    }],
+    "UserPromptSubmit": [{
+      "hooks": [{
+        "type": "command",
+        "command": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','integrated-hook.mjs')).href)\"",
+        "commandWindows": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','integrated-hook.mjs')).href)\"",
+        "statusMessage": "Recalling memory and checking role orchestration",
+        "additionalContextLimit": 10000,
+        "timeout": 40
+      }]
+    }],
+    "PreToolUse": [{
+      "matcher": "*",
+      "hooks": [{
+        "type": "command",
+        "command": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','integrated-hook.mjs')).href)\"",
+        "commandWindows": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','integrated-hook.mjs')).href)\"",
+        "statusMessage": "Checking memory and role policy",
+        "additionalContextLimit": 7000,
+        "timeout": 20
+      }]
+    }],
+    "PostToolUse": [{
+      "matcher": "*",
+      "hooks": [{
+        "type": "command",
+        "command": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','integrated-hook.mjs')).href)\"",
+        "commandWindows": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','integrated-hook.mjs')).href)\"",
+        "statusMessage": "Recording project and role evidence",
+        "timeout": 20
+      }]
+    }],
+    "PreCompact": [{
+      "matcher": "manual|auto",
+      "hooks": [{
+        "type": "command",
+        "command": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','integrated-hook.mjs')).href)\"",
+        "commandWindows": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','integrated-hook.mjs')).href)\"",
+        "statusMessage": "Checkpointing project and role state",
+        "timeout": 20
+      }]
+    }],
+    "PostCompact": [{
+      "matcher": "manual|auto",
+      "hooks": [{
+        "type": "command",
+        "command": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','integrated-hook.mjs')).href)\"",
+        "commandWindows": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','integrated-hook.mjs')).href)\"",
+        "statusMessage": "Updating role generation health",
+        "timeout": 20
+      }]
+    }],
+    "Stop": [{
+      "hooks": [{
+        "type": "command",
+        "command": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','integrated-hook.mjs')).href)\"",
+        "commandWindows": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','integrated-hook.mjs')).href)\"",
+        "statusMessage": "Checking completion and recording role stop",
+        "timeout": 20
+      }]
+    }],
+    "SessionEnd": [{
+      "hooks": [{
+        "type": "command",
+        "command": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','integrated-hook.mjs')).href)\"",
+        "commandWindows": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','integrated-hook.mjs')).href)\"",
+        "statusMessage": "Exporting project and role state",
+        "timeout": 3
+      }]
+    }]
   }
 }

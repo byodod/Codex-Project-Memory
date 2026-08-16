@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryStore, resolveProject } from "../dist/library.mjs";
@@ -83,6 +83,25 @@ test("FTS retrieval boosts exact symbols and supersession hides stale decisions"
   }
 });
 
+test("FTS relevance is not discarded by authority boosts and returned recall metadata is current", () => {
+  const { store, project } = fixture();
+  try {
+    store.storeMemory(project, {
+      kind: "decision", summary: "Generic Hook policy", content: "Hooks are enabled for this project.",
+      authority: "user_decision", importance: 1
+    });
+    const failure = store.storeMemory(project, {
+      kind: "failure", summary: "Coordinator bootstrap timeout", content: "role_start left a bootstrapping candidate after a coordinator timeout and recursive retry",
+      authority: "tool_observation", importance: 1
+    });
+    const results = store.search(project, "coordinator bootstrap timeout recursive role_start candidate", { limit: 5 });
+    assert.equal(results[0].id, failure.id);
+    assert.equal(results[0].recall_count, 1);
+    assert.ok(results[0].last_recalled_at);
+    assert.equal(store.getMemory(project, failure.id).recall_count, 1);
+  } finally { store.close(); }
+});
+
 test("consolidation previews and archives only exact normalized duplicates", () => {
   const { store, project } = fixture();
   try {
@@ -101,4 +120,24 @@ test("consolidation previews and archives only exact normalized duplicates", () 
   } finally {
     store.close();
   }
+});
+
+test("project reset removes every memory record and its human-readable export", () => {
+  const { store, project, data } = fixture();
+  try {
+    const task = store.upsertTask(project, { title: "Disposable", goal: "Populate all reset tables" });
+    store.storeMemory(project, { task_id: task.id, kind: "note", summary: "Disposable", content: "Delete me", authority: "agent_inference" });
+    store.recordEvent(project, { taskId: task.id, eventType: "test" });
+    store.recordVerification(project, { taskId: task.id, status: "passed", evidence: "test" });
+    store.checkpoint(project, { taskId: task.id, trigger: "test" });
+    const exportDirectory = join(data, "projects", project.id);
+    assert.equal(existsSync(exportDirectory), true);
+
+    const reset = store.resetProject(project);
+    assert.equal(reset.deleted, true);
+    assert.deepEqual(reset.counts, { tasks: 1, memories: 1, events: 1, verifications: 1, checkpoints: 1 });
+    assert.equal(existsSync(exportDirectory), false);
+    assert.equal(store.db.prepare("SELECT count(*) n FROM projects WHERE id=?").get(project.id).n, 0);
+    assert.equal(store.db.prepare("SELECT count(*) n FROM memories WHERE project_id=?").get(project.id).n, 0);
+  } finally { store.close(); }
 });

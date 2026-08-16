@@ -1,6 +1,6 @@
-# Codex Project Memory
+# Codex Project Runtime
 
-A Codex-native long-horizon memory plugin for software projects. It combines lifecycle Hooks, a local MCP server, SQLite FTS5, provenance labels, compact task snapshots, pre-compaction checkpoints, and a completion gate.
+A single Codex plugin that combines long-horizon project memory with persistent role orchestration. It bundles two local MCP control planes, one integrated lifecycle Hook, SQLite FTS5 recall, a user-facing Liaison, an internal Coordinator, typed role routing, replaceable role task generations, checkpoints, verification evidence, and a completion gate.
 
 It is designed to prevent the failures that matter during long development work:
 
@@ -10,7 +10,7 @@ It is designed to prevent the failures that matter during long development work:
 - treating tool output or web text as authoritative instructions;
 - claiming completion before acceptance criteria and verification are satisfied.
 
-The plugin is local-only, offline, and requires no OpenAI API key.
+The plugin is local-only, offline, and requires no OpenAI API key. The former standalone Role Runtime remains a source component in this repository, but users install only `codex-project-memory`; the installer removes the duplicate standalone installation while preserving its existing role database.
 
 ## Install
 
@@ -32,7 +32,9 @@ npm test
 sh ./scripts/install.sh
 ```
 
-Then restart Codex and begin a new task. Plugin hooks are non-managed code: open `/hooks`, inspect them, and trust the current definitions. The MCP server is exposed as `project_memory`.
+Then restart Codex and begin a new task. Plugin hooks are non-managed code: open `/hooks`, inspect them, and trust the current definitions. The plugin exposes `project_memory` and `role_runtime` MCP servers.
+
+To initialize the default role topology, send `初始化角色编排`. The integrated Hook creates the four role definitions and binds the current task as `role://liaison`. In that same turn, the Liaison model uses Codex desktop task interfaces to find or create the Coordinator and records the actual task id with `role_attach`. Repeating the exact prompt from another task hands the Liaison generation off safely. If any bound role task is missing, archived, deleted, or unavailable, the model simply creates a new desktop task and attaches it; the old generation is retired. MCP calls persist role state and typed messages but never start Codex CLI, App Server, or hidden model turns.
 
 ## Normal Codex workflow
 
@@ -67,23 +69,40 @@ The `Stop` Hook asks Codex for one continuation when an enabled active task stil
 
 Always pass the current repository directory as `cwd` when calling MCP tools.
 
+Role Runtime adds role definition/status, `role_attach`, role facts, task graph, typed mailboxes, Liaison-to-Coordinator request/result persistence, change envelopes, architecture epochs, and atomic generation replacement. Project Memory remains the durable user-level completion contract; Role Runtime is the internal execution graph. Their task ids are separate namespaces: Role Runtime `task_id` fields only accept Role Runtime task ids, while a Project Memory association belongs in `payload.project_memory_task_id`.
+
+## Reset one project completely
+
+The installed plugin includes a destructive, project-scoped reset command. It removes the resolved project's Project Memory tasks, memories, events, verifications, checkpoints and generated exports, plus all Role Runtime roles, generations, task graph, messages, rotations, events and change envelopes. Other projects are not touched.
+
+After installing or updating the plugin and starting a new Codex task, type `/` in the composer and choose **Reset Project Runtime** (`reset-project`). Enabled skills are shown in Codex's slash-command list, so this is the normal user-facing reset entry. The skill is explicit-only: Codex will not select it implicitly from an ordinary cleanup request. It resolves the current project root and delegates the destructive operation to the guarded CLI below.
+
+The command requires the same exact project root twice, so a mistyped `cwd` cannot be silently confirmed:
+
+```powershell
+$projectRoot = "E:\Github\4.6\Game-10"
+node --no-warnings "$env:USERPROFILE\plugins\codex-project-memory\dist\cli.mjs" reset-project --cwd $projectRoot --confirm-root $projectRoot
+```
+
+This cannot be undone from the plugin. Close or stop active role work first. Existing Codex tasks may remain visible in task history, but after reset they have no role authority or durable project state. Start a new Codex task and send `初始化角色编排` to rebuild the project from zero.
+
 ## Hook behavior
 
 | Hook | Behavior |
 |---|---|
-| `SessionStart(startup/resume/compact)` | Inject a short task rehydration pack and curated memory |
-| `UserPromptSubmit` | Record a redacted prompt event and recall relevant history |
-| `PreToolUse` | Recall file/symbol/error/failure context for Bash and edits |
-| `PostToolUse` | Capture bounded, redacted objective tool evidence with a fast local write |
-| `PreCompact` | Atomically checkpoint task and recent event identifiers |
-| `Stop` | Continue once if the active completion gate remains open |
-| `SessionEnd` | Refresh human-readable exports |
+| `SessionStart(startup/resume/clear/compact)` | Merge task/memory rehydration with the active role anchor |
+| `UserPromptSubmit` | Recall relevant memory, initialize exact role prompts, and reject stale role generations |
+| `PreToolUse` | Merge relevant memory with role permission enforcement |
+| `PostToolUse` | Capture bounded objective evidence and role events |
+| `PreCompact` / `PostCompact` | Checkpoint project state and update role-generation health |
+| `Stop` | Enforce the project completion gate and record role stop state |
+| `SessionEnd` | Refresh memory exports and close the role-generation session |
 
-Hooks never rewrite or deny tool calls. Automatic failure capture remains low-importance episodic memory until explicitly curated.
+Memory recall never rewrites tool calls. Role policy can deny stale generations or tools outside a role's charter. Automatic failure capture remains low-importance episodic memory until explicitly curated.
 
 ## Storage and inspection
 
-When installed, Codex supplies `PLUGIN_DATA` to hooks and the installer gives the MCP server the same per-plugin directory through `CODEX_PROJECT_MEMORY_HOME`. Standalone development uses `~/.codex-project-memory` or an explicit `CODEX_PROJECT_MEMORY_HOME`.
+Hooks, MCP, and the CLI all use `~/.codex/plugin-data/codex-project-memory` by default. Codex supplies `PLUGIN_DATA` to Hooks, while the installer gives MCP the same directory through `CODEX_PROJECT_MEMORY_HOME`; either variable can explicitly override the default for testing or migration. This avoids the old split where the CLI silently read `~/.codex-project-memory` while MCP used the plugin database.
 
 ```text
 <data-root>/
@@ -93,12 +112,15 @@ When installed, Codex supplies `PLUGIN_DATA` to hooks and the installer gives th
     tasks/<task-id>.json
 ```
 
+Existing Role Runtime data remains under `~/.codex/plugin-data/codex-role-runtime/role-runtime.sqlite3`, so upgrading to the unified plugin does not reset active roles or audit history.
+
 Inspect the current project without Codex:
 
 ```powershell
 node --no-warnings .\dist\cli.mjs status --cwd C:\path\to\repo
 node --no-warnings .\dist\cli.mjs search SaveSystem --cwd C:\path\to\repo
 node --no-warnings .\dist\cli.mjs checkpoint --cwd C:\path\to\repo
+node --no-warnings .\dist\cli.mjs reset-project --cwd C:\path\to\repo --confirm-root C:\path\to\repo
 ```
 
 `MEMORY.md` is an inspectable projection. SQLite is the machine source of truth. See [architecture](./docs/architecture.md), [data model](./docs/data-model.md), and [security](./SECURITY.md).
@@ -112,7 +134,7 @@ npm run doctor
 npm run pack:check
 ```
 
-The tests exercise task completion gates, FTS/symbol ranking, supersession, duplicate consolidation, Hook rehydration/recall/checkpoint/redaction, and a real MCP stdio client/server exchange.
+The tests exercise task completion gates, FTS relevance and recall metadata, supersession, duplicate consolidation, merged Hook behavior, desktop-task attachment/replacement, durable request/result routing, and real stdio exchanges with both MCP servers.
 
 ## Updating a local installation
 
