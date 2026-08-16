@@ -117,3 +117,14 @@ The tests exercise task completion gates, FTS/symbol ranking, supersession, dupl
 ## Updating a local installation
 
 Run the install script again. It builds first, preserves the previous plugin source as a timestamped backup, refreshes the personal marketplace entry, and asks Codex to reinstall the plugin. Restart Codex and use a new task so the new skill, MCP server, and Hook hashes are loaded. Review changed Hook definitions again with `/hooks`.
+
+## References and acknowledgements
+
+This project was independently implemented for Codex. Its design research was informed by these open-source agent projects; their source code is not bundled or copied into this plugin:
+
+- [Hermes Agent](https://github.com/NousResearch/hermes-agent) — persistent learning, experience-derived skills, and cross-session retrieval.
+- [OpenClaw](https://github.com/openclaw/openclaw) — file-backed long-term memory, memory search, and pre-compaction context preservation.
+
+## License
+
+Codex Project Memory is released under the [MIT License](./LICENSE).
