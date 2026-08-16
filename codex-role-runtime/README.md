@@ -66,7 +66,7 @@ That single prompt:
 1. Creates the standard four-role topology idempotently.
 2. Binds the current task to `role://liaison` as the user's entry point. Repeating the exact prompt from another task safely retires the old Liaison generation and hands the role off to the current task.
 3. The Hook itself starts and deterministically activates the first `role://coordinator` task through Codex App Server before the Liaison model turn begins.
-4. Keeps later user requests flowing through `liaison_request`, which wakes the Coordinator and returns its result to the Liaison.
+4. Keeps later user requests flowing through `liaison_request`, which verifies or repairs the Coordinator task, wakes it, and returns its result to the Liaison.
 
 The four intentionally narrow, read-only long-lived roles are:
 
@@ -122,7 +122,9 @@ ROTATION_PENDING → DRAINING → CHECKPOINTING → VALIDATING
 → BOOTSTRAPPING → CUTOVER → COMPLETED
 ```
 
-The runtime builds the candidate's bootstrap packet from authoritative SQLite role state, validates it locally, and then performs atomic cutover. Startup does not set an active native goal or wait for a model-generated health echo, so initialization cannot accidentally launch competing model turns. A failed attempt rejects its candidate before a retry.
+The runtime builds the candidate's bootstrap packet from authoritative SQLite role state, validates it locally, and then performs atomic cutover. Startup does not set an active native goal or wait for a model-generated health echo, so initialization cannot accidentally launch competing model turns. A failed attempt rejects its candidate before a retry. An `active` SQLite row is not treated as sufficient proof of health: `role_start` resumes the backing App Server task, closes incompatible stale rotation residue if that task is missing, and creates one replacement generation. `liaison_request` performs this check automatically before routing.
+
+Role Runtime task ids and Project Memory task ids are separate namespaces. The optional `task_id` accepted by typed Role Runtime messages must name a Role Runtime task; carry a Project Memory association in `payload.project_memory_task_id` instead.
 
 ## MCP surface
 

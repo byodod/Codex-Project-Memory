@@ -68,7 +68,7 @@ tool("role_bind", {
 }, ({ cwd, role_key, thread_id }: any) => run(cwd, (store, project) => store.bindInitial(project, role_key, thread_id)));
 
 tool("role_start", {
-  title: "Start initial role task", description: "Idempotently create and deterministically activate the first Codex task generation for a standard role through App Server. Use this to start the Coordinator after one-prompt initialization.",
+  title: "Start or recover role task", description: "Verify the active App Server task, return it idempotently when present, or deterministically replace a missing task without competing bootstrap turns.",
   inputSchema: { cwd, role_key: z.string(), model: z.string().optional() }, annotations: { readOnlyHint: false, idempotentHint: true }
 }, ({ cwd, role_key, model }: any) => runAsync(cwd, (store, project) => startRoleGeneration(store, project, role_key, { ...(model ? { model } : {}) })));
 
@@ -125,7 +125,7 @@ tool("message_ack", {
 }, ({ cwd, role_key, message_id }: any) => run(cwd, (store, project) => store.acknowledgeMessage(project, role_key, message_id)));
 
 tool("liaison_request", {
-  title: "Send user request through Coordinator", description: "Send a user request from the active Liaison generation, wake the active Coordinator task, wait for its response, and persist the response back to the Liaison mailbox.",
+  title: "Send user request through Coordinator", description: "Start or recover the Coordinator task, send a user request from the active Liaison generation, wait for its response, and persist the response back to the Liaison mailbox. task_id, when supplied, is a Role Runtime task id rather than a Project Memory task id.",
   inputSchema: {
     cwd, liaison_generation: z.number().int().positive(), request: z.string().min(1).max(20000),
     task_id: z.string().optional(), scope: z.string().max(2000).optional(), message_id: z.string().optional()

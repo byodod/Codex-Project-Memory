@@ -17,21 +17,21 @@ When the user sends exactly `初始化角色编排`, `启动角色编排`, or `i
 2. Bind the current task to `role://liaison`, the only user-facing role. If another Liaison task is active, deterministically hand the Liaison generation off to the current task and retire the old generation.
 3. Create and deterministically activate the Coordinator task before the Liaison model turn begins.
 
-Afterward, call both `role_runtime.status` and `project_memory.task_get` with the current `cwd`. If the Coordinator startup was interrupted, call the idempotent `role_start`; do not ask the user to repair it. If no matching project-memory task exists for substantive work, create one with `task_upsert`.
+Afterward, call both `role_runtime.status` and `project_memory.task_get` with the current `cwd`. If the Coordinator startup was interrupted, call the idempotent `role_start`; do not ask the user to repair it. `role_start` verifies the recorded App Server task rather than trusting SQLite health alone and deterministically replaces a missing task. If no matching project-memory task exists for substantive work, create one with `task_upsert`.
 
 ## Shared operating model
 
-- The Liaison clarifies user intent and uses `liaison_request`; it does not implement or internally coordinate work.
+- The Liaison clarifies user intent and uses `liaison_request`; it does not implement or internally coordinate work. The Coordinator returns the final Liaison response as assistant text, and the outer request persists exactly one RESULT; do not recursively call `liaison_request` or `message_send` for that final reply.
 - The Coordinator owns the role task graph and routes work. It keeps the current project-memory task aligned with the user's goal, acceptance criteria, completed items, blockers, and next steps.
 - Architect and module owners store role-specific charters, ownership, and invariants with `role_state_put`. Cross-role decisions and reusable project facts also go to `memory_store` with honest provenance.
 - Workers receive a bounded change envelope and perform implementation. Record meaningful build/test/review results with `verification_record`.
 - The Verifier independently checks acceptance. Only after criteria are satisfied should the Coordinator clear project-memory next steps/blockers and complete the task.
 
-Project Memory is the durable user-level completion contract. Role Runtime tasks are the internal execution graph. Link a role task to the project-memory task in its payload when useful; never create contradictory sources of truth.
+Project Memory is the durable user-level completion contract. Role Runtime tasks are the internal execution graph. Their ids are different namespaces: `liaison_request.task_id` and `message_send.task_id` accept only Role Runtime task ids. Link a request or role task to Project Memory with `payload.project_memory_task_id` when useful; never create contradictory sources of truth.
 
 ## Generation lifecycle
 
-Address roles as `role://<role-key>`, never by task id. A task belongs to one role for life, and only the active generation may send authoritative results. `role_start` is idempotent. Rotation creates a candidate task, validates authoritative SQLite state locally, and atomically cuts over without setting an active goal or waiting for a model health echo. Failed candidates are rejected; the prior active generation remains authoritative.
+Address roles as `role://<role-key>`, never by task id. A task belongs to one role for life, and only the active generation may send authoritative results. `role_start` is idempotent: it resumes the recorded App Server task to verify existence, and if the task is gone it closes stale recovery residue and deterministically replaces the generation. Rotation creates a candidate task, validates authoritative SQLite state locally, and atomically cuts over without setting an active goal or waiting for a model health echo. Failed candidates are rejected; the prior active generation remains authoritative when it still exists.
 
 Bootstrapping candidates may receive a role anchor but cannot accept prompts or tools before cutover. Retired and rejected generations are stale and must not continue work.
 

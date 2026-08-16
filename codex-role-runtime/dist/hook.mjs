@@ -4,6 +4,10 @@ import { readFileSync } from "node:fs";
 // src/app-server.ts
 import { execFileSync, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
+function isMissingThreadError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /no rollout found|no codex thread found|thread(?: id)?[^\n]*not found|unknown thread/i.test(message);
+}
 function resolveCodexBinary() {
   if (process.env.CODEX_BIN) {
     return process.env.CODEX_BIN;
@@ -38,11 +42,13 @@ var AppServerClient = class _AppServerClient {
       if (this.stderr.length > 50) this.stderr.shift();
     });
     this.child.on("exit", (code) => {
+      const error = new Error(`Codex app-server exited with ${code}. ${this.stderr.join("").slice(-2e3)}`);
       for (const waiter of this.pending.values()) {
         clearTimeout(waiter.timer);
-        waiter.reject(new Error(`Codex app-server exited with ${code}. ${this.stderr.join("").slice(-2e3)}`));
+        waiter.reject(error);
       }
       this.pending.clear();
+      for (const listener of [...this.listeners]) listener({ method: "app-server/exited", params: { error: error.message } });
     });
   }
   static async connect() {
@@ -103,40 +109,105 @@ var AppServerClient = class _AppServerClient {
     const result = await this.request("thread/resume", { threadId }, 6e4);
     if (result?.thread?.id !== threadId) throw new Error(`thread/resume returned the wrong thread: ${JSON.stringify(result)}`);
   }
+  async threadExists(threadId) {
+    try {
+      const result = await this.request("thread/read", { threadId, includeTurns: false }, 6e4);
+      return result?.thread?.id === threadId;
+    } catch (error) {
+      if (isMissingThreadError(error)) return false;
+      throw error;
+    }
+  }
   async runTurn(threadId, prompt, timeoutMs = 9e5) {
     await this.resumeThread(threadId);
     let lastText = "";
+    let cleanup = () => void 0;
     const completed = new Promise((resolve2, reject) => {
       const timer = setTimeout(() => {
-        this.listeners.delete(listener);
+        cleanup();
         reject(new Error("Role dispatch turn timed out."));
       }, timeoutMs);
       const listener = (message) => {
         const params = message.params || {};
         if (params.threadId && params.threadId !== threadId) return;
+        if (message.method === "app-server/exited") {
+          cleanup();
+          reject(new Error(params.error || "Codex app-server exited during role dispatch."));
+          return;
+        }
         if (message.method === "item/agentMessage/delta") lastText += params.delta || "";
         if (message.method === "item/completed" && params.item?.type === "agentMessage") lastText = params.item.text || lastText;
         if (message.method === "turn/completed") {
-          clearTimeout(timer);
-          this.listeners.delete(listener);
-          if (params.turn?.status && !["completed", "Completed"].includes(params.turn.status)) reject(new Error(`Role dispatch turn ${params.turn.status}`));
-          else resolve2();
+          cleanup();
+          if (params.turn?.status && !["completed", "Completed"].includes(params.turn.status)) {
+            reject(new Error(`Role dispatch turn ${params.turn.status}${params.turn?.error?.message ? `: ${params.turn.error.message}` : ""}`));
+          } else resolve2();
         }
+      };
+      cleanup = () => {
+        clearTimeout(timer);
+        this.listeners.delete(listener);
       };
       this.listeners.add(listener);
     });
-    await this.request("turn/start", { threadId, input: [{ type: "text", text: prompt }] }, 6e4);
-    await completed;
-    return lastText.trim();
+    try {
+      await this.request("turn/start", { threadId, input: [{ type: "text", text: prompt }] }, 6e4);
+      await completed;
+      return lastText.trim();
+    } catch (error) {
+      cleanup();
+      throw error;
+    }
   }
   close() {
     this.lines.close();
+    if (this.child.exitCode !== null || this.child.killed) return;
     this.child.stdin.end();
-    this.child.kill();
+    const timer = setTimeout(() => {
+      if (this.child.exitCode !== null) return;
+      if (process.platform === "win32" && this.child.pid) {
+        const killer = spawn("taskkill.exe", ["/pid", String(this.child.pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
+        killer.unref();
+      } else {
+        this.child.kill();
+      }
+    }, 2e3);
+    timer.unref();
+    this.child.once("exit", () => clearTimeout(timer));
   }
 };
 
 // src/generation-service.ts
+async function activeTaskExists(active, options) {
+  if (options.taskExists) return options.taskExists(active.thread_id);
+  if (options.clientFactory) return true;
+  const client = await AppServerClient.connect();
+  try {
+    return await client.threadExists(active.thread_id);
+  } finally {
+    client.close();
+  }
+}
+function rotationIsFresh(rotation, maximumAgeMs = 12e4) {
+  const updated = Date.parse(String(rotation.updated_at || rotation.created_at || ""));
+  return Number.isFinite(updated) && Date.now() - updated <= maximumAgeMs;
+}
+async function replaceMissingActiveGeneration(store2, project, roleKey, missing, options) {
+  const current = store2.activeGeneration(project, roleKey);
+  if (!current || current.id !== missing.id) {
+    return { role: roleKey, status: current ? "active" : "starting", started: false, recovered: true, generation: current };
+  }
+  const candidate = store2.bootstrappingGeneration(project, roleKey);
+  const rotation = store2.openRotation(project, roleKey);
+  const sameRecovery = rotation && String(rotation.old_generation_id || "") === current.id;
+  if (rotation && sameRecovery && rotationIsFresh(rotation)) {
+    return candidate ? { role: roleKey, status: "bootstrapping", started: false, recovered: true, generation: candidate, rotation_id: rotation.id } : { role: roleKey, status: "starting", started: false, recovered: true, rotation_id: rotation.id };
+  }
+  if (candidate) store2.rejectCandidate(candidate.id, `Recovered stale bootstrap while replacing missing task ${current.thread_id}.`);
+  if (rotation) store2.updateRotation(String(rotation.id), "FAILED", { error: `Superseded while replacing missing active task ${current.thread_id}.` });
+  const result = await rotateRoleGeneration(store2, project, roleKey, `Active App Server task ${current.thread_id} no longer exists.`, options);
+  return { ...result, status: "active", started: true, recovered: true, replaced_generation: current };
+}
 function expectedBootstrap(store2, project, role) {
   const context2 = store2.context(project, role.role_key);
   const facts = context2.facts;
@@ -228,7 +299,10 @@ function handoffRoleGenerationToThread(store2, project, roleKey, threadId, reaso
 }
 async function startRoleGeneration(store2, project, roleKey, options = {}) {
   const active = store2.activeGeneration(project, roleKey);
-  if (active) return { role: roleKey, status: "active", started: false, generation: active };
+  if (active) {
+    if (await activeTaskExists(active, options)) return { role: roleKey, status: "active", started: false, generation: active };
+    return replaceMissingActiveGeneration(store2, project, roleKey, active, options);
+  }
   const candidate = store2.bootstrappingGeneration(project, roleKey);
   const rotation = store2.openRotation(project, roleKey);
   if (candidate && rotation) return { role: roleKey, status: "bootstrapping", started: false, generation: candidate, rotation_id: rotation.id };
@@ -753,6 +827,10 @@ var RoleStore = class {
     }
     this.assertCurrent(from, input2.from_generation);
     if (input2.architecture_epoch !== this.projectEpoch(project)) throw new Error("STALE_ARCHITECTURE_EPOCH");
+    if (input2.task_id) {
+      const task = this.db.prepare("SELECT id FROM tasks WHERE id=? AND project_id=?").get(input2.task_id, project.id);
+      if (!task) throw new Error("ROLE_TASK_NOT_FOUND: task_id must reference a Role Runtime task; put a Project Memory task id in payload.project_memory_task_id instead.");
+    }
     const id = input2.message_id || newId("msg");
     const time = nowIso();
     this.db.prepare(`INSERT INTO messages(id,project_id,type,from_role_id,to_role_id,from_generation,task_id,scope,architecture_epoch,payload,evidence_refs,reply_to,status,created_at)

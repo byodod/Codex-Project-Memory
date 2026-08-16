@@ -24,10 +24,12 @@ When the user sends exactly `初始化角色编排`, `启动角色编排`, or `i
 The Hook starts the Coordinator itself before the Liaison model turn. After it binds the Liaison:
 
 1. Call `status` with the current `cwd`.
-2. Confirm the Coordinator is active. If startup was interrupted, call the idempotent `role_start` for `coordinator` to recover it; do not ask the user to run a CLI command.
+2. Confirm the Coordinator is active. If startup was interrupted, call the idempotent `role_start` for `coordinator` to recover it; do not ask the user to run a CLI command. `role_start` verifies that the recorded App Server task still exists and replaces a missing task after closing stale bootstrap/rotation residue.
 3. Confirm that the user-facing entry and Coordinator are ready. Do not expose internal thread ids.
 
-For each later substantive user request, clarify only material ambiguity, then call `liaison_request` with the current Liaison generation and a faithful structured request. Translate the returned Coordinator response into concise user-facing language. Do not implement, schedule, architect, or verify work inside the Liaison task.
+For each later substantive user request, clarify only material ambiguity, then call `liaison_request` with the current Liaison generation and a faithful structured request. It starts or repairs the Coordinator before routing and retries once if the task disappears between the health check and dispatch. The Coordinator returns its final reply as assistant text; it must not call `liaison_request` or `message_send` for that final reply because the outer request persists exactly one RESULT. Translate the returned response into concise user-facing language. Do not implement, schedule, architect, or verify work inside the Liaison task.
+
+`liaison_request.task_id` and `message_send.task_id` refer only to tasks in the Role Runtime task graph. To associate a request with a Project Memory task, put that id in `payload.project_memory_task_id`; the two control-plane ids are intentionally not interchangeable.
 
 If custom initialization is required, use `project_initialize`, `project_configure`, and `role_define`. Long-lived governance and owner roles should normally be `read_only`; use short-lived `workspace_write` workers for implementation. Record critical invariants, accepted decisions, ownership, open questions, failures, and artifacts with `role_state_put`, never transcript summaries.
 
@@ -55,7 +57,7 @@ Preferred one-command flow:
 
 `node <plugin-root>/dist/cli.mjs rotate <role-key> --cwd <project> --reason <reason>`
 
-The CLI performs `ROTATION_PENDING → DRAINING → CHECKPOINTING → VALIDATING → BOOTSTRAPPING → CUTOVER`, creates a new thread through Codex App Server, validates an authoritative bootstrap packet locally, and switches atomically. Initialization does not set an active native goal or wait for a model echo. If bootstrap fails, the candidate is rejected and the old generation stays active.
+The CLI performs `ROTATION_PENDING → DRAINING → CHECKPOINTING → VALIDATING → BOOTSTRAPPING → CUTOVER`, creates a new thread through Codex App Server, validates an authoritative bootstrap packet locally, and switches atomically. Initialization does not set an active native goal or wait for a model echo. If bootstrap fails, the candidate is rejected and the old generation stays active. If SQLite says a generation is active but App Server reports that its task no longer exists, `role_start` closes incompatible stale rotation residue and uses this same deterministic cutover path to replace it exactly once.
 
 For an external driver, use `rotation_prepare`, `rotation_candidate_register`, and `rotation_cutover` in that order.
 

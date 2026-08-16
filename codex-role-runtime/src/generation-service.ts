@@ -1,4 +1,4 @@
-import { AppServerClient } from "./app-server.js";
+import { AppServerClient, isMissingThreadError } from "./app-server.js";
 import { RoleStore, SendMessageInput } from "./store.js";
 import { BootstrapResponse, GenerationRecord, ProjectContext, RolePolicy, RoleRecord } from "./types.js";
 
@@ -15,12 +15,53 @@ export interface DispatchClient {
 export interface GenerationOptions {
   model?: string;
   clientFactory?: () => Promise<GenerationClient>;
+  taskExists?: (threadId: string) => Promise<boolean>;
 }
 
 export interface DispatchOptions {
   generationOptions?: GenerationOptions;
   clientFactory?: () => Promise<DispatchClient>;
   timeoutMs?: number;
+}
+
+export interface LiaisonDispatchOptions {
+  generationOptions?: GenerationOptions;
+  clientFactory?: () => Promise<DispatchClient>;
+  timeoutMs?: number;
+}
+
+async function activeTaskExists(active: GenerationRecord, options: GenerationOptions): Promise<boolean> {
+  if (options.taskExists) return options.taskExists(active.thread_id);
+  // A custom creation client is a test/integration seam and may not implement App Server probing.
+  if (options.clientFactory) return true;
+  const client = await AppServerClient.connect();
+  try { return await client.threadExists(active.thread_id); } finally { client.close(); }
+}
+
+function rotationIsFresh(rotation: Record<string, unknown>, maximumAgeMs = 120_000): boolean {
+  const updated = Date.parse(String(rotation.updated_at || rotation.created_at || ""));
+  return Number.isFinite(updated) && Date.now() - updated <= maximumAgeMs;
+}
+
+async function replaceMissingActiveGeneration(store: RoleStore, project: ProjectContext, roleKey: string, missing: GenerationRecord, options: GenerationOptions): Promise<Record<string, unknown>> {
+  const current = store.activeGeneration(project, roleKey);
+  if (!current || current.id !== missing.id) {
+    return { role: roleKey, status: current ? "active" : "starting", started: false, recovered: true, generation: current };
+  }
+
+  const candidate = store.bootstrappingGeneration(project, roleKey);
+  const rotation = store.openRotation(project, roleKey) as Record<string, unknown> | null;
+  const sameRecovery = rotation && String(rotation.old_generation_id || "") === current.id;
+  if (rotation && sameRecovery && rotationIsFresh(rotation)) {
+    return candidate
+      ? { role: roleKey, status: "bootstrapping", started: false, recovered: true, generation: candidate, rotation_id: rotation.id }
+      : { role: roleKey, status: "starting", started: false, recovered: true, rotation_id: rotation.id };
+  }
+
+  if (candidate) store.rejectCandidate(candidate.id, `Recovered stale bootstrap while replacing missing task ${current.thread_id}.`);
+  if (rotation) store.updateRotation(String(rotation.id), "FAILED", { error: `Superseded while replacing missing active task ${current.thread_id}.` });
+  const result = await rotateRoleGeneration(store, project, roleKey, `Active App Server task ${current.thread_id} no longer exists.`, options) as Record<string, unknown>;
+  return { ...result, status: "active", started: true, recovered: true, replaced_generation: current };
 }
 
 export function expectedBootstrap(store: RoleStore, project: ProjectContext, role: RoleRecord): BootstrapResponse {
@@ -102,7 +143,10 @@ export function handoffRoleGenerationToThread(store: RoleStore, project: Project
 
 export async function startRoleGeneration(store: RoleStore, project: ProjectContext, roleKey: string, options: GenerationOptions = {}): Promise<unknown> {
   const active = store.activeGeneration(project, roleKey);
-  if (active) return { role: roleKey, status: "active", started: false, generation: active };
+  if (active) {
+    if (await activeTaskExists(active, options)) return { role: roleKey, status: "active", started: false, generation: active };
+    return replaceMissingActiveGeneration(store, project, roleKey, active, options);
+  }
   const candidate = store.bootstrappingGeneration(project, roleKey);
   const rotation = store.openRotation(project, roleKey);
   if (candidate && rotation) return { role: roleKey, status: "bootstrapping", started: false, generation: candidate, rotation_id: rotation.id };
@@ -119,21 +163,18 @@ export async function dispatchRoleMessage(store: RoleStore, project: ProjectCont
   const shouldWake = AUTO_WAKE_TYPES.has(input.type) && input.to_role !== "coordinator" && input.to_role !== "liaison";
   if (!shouldWake) return { message, wake: { status: "not_required" } };
 
-  let generation = store.activeGeneration(project, input.to_role);
-  let startup: unknown = null;
-  if (!generation) {
-    startup = await startRoleGeneration(store, project, input.to_role, options.generationOptions);
-    generation = store.activeGeneration(project, input.to_role);
-  }
-  if (!generation) throw new Error(`ROLE_WAKE_TARGET_NOT_ACTIVE: role://${input.to_role}`);
-
   if (!store.claimMessageWake(project, String(message.id))) {
     const current = store.message(project, String(message.id));
-    return { message: current ?? message, startup, wake: { status: String(current?.wake_status || "already_claimed"), deduplicated: true } };
+    return { message: current ?? message, startup: null, wake: { status: String(current?.wake_status || "already_claimed"), deduplicated: true } };
   }
 
-  const client = options.clientFactory ? await options.clientFactory() : await AppServerClient.connect();
+  let startup: unknown = null;
+  let client: DispatchClient | null = null;
   try {
+    startup = await startRoleGeneration(store, project, input.to_role, options.generationOptions);
+    const generation = store.activeGeneration(project, input.to_role);
+    if (!generation) throw new Error(`ROLE_WAKE_TARGET_NOT_ACTIVE: role://${input.to_role}`);
+    client = options.clientFactory ? await options.clientFactory() : await AppServerClient.connect();
     const response = await client.runTurn(generation.thread_id, [
       store.roleAnchor(project, input.to_role),
       `A durable ${input.type} message has arrived from role://${input.from_role}. Process it now; this is an active work turn, not an anchor-only bootstrap.`,
@@ -147,15 +188,16 @@ export async function dispatchRoleMessage(store: RoleStore, project: ProjectCont
     const reason = error instanceof Error ? error.message : String(error);
     store.failMessageWake(project, String(message.id), reason);
     throw new Error(`ROLE_WAKE_FAILED: role://${input.to_role}: ${reason}`);
-  } finally { client.close(); }
+  } finally { client?.close(); }
 }
 
-export async function dispatchLiaisonRequest(store: RoleStore, project: ProjectContext, input: { liaison_generation: number; request: string; task_id?: string; scope?: string; message_id?: string }): Promise<unknown> {
+export async function dispatchLiaisonRequest(store: RoleStore, project: ProjectContext, input: { liaison_generation: number; request: string; task_id?: string; scope?: string; message_id?: string }, options: LiaisonDispatchOptions = {}): Promise<unknown> {
   const liaison = store.getRole(project, "liaison");
   const coordinator = store.getRole(project, "coordinator");
   if (!liaison || !coordinator) throw new Error("STANDARD_TOPOLOGY_NOT_INITIALIZED");
   store.assertCurrent(liaison, input.liaison_generation);
-  const coordinatorGeneration = store.activeGeneration(project, "coordinator");
+  const startup = await startRoleGeneration(store, project, "coordinator", options.generationOptions);
+  let coordinatorGeneration = store.activeGeneration(project, "coordinator");
   if (!coordinatorGeneration) throw new Error("COORDINATOR_NOT_ACTIVE: call role_start for role://coordinator first");
   const architectureEpoch = store.projectEpoch(project);
   const requestInput: SendMessageInput = {
@@ -171,26 +213,39 @@ export async function dispatchLiaisonRequest(store: RoleStore, project: ProjectC
   };
   const requestMessage = store.sendMessage(project, requestInput);
   store.inbox(project, "coordinator");
-  const client = await AppServerClient.connect();
-  try {
-    const responseText = await client.runTurn(coordinatorGeneration.thread_id, [
+  const prompt = [
       store.roleAnchor(project, "coordinator"),
       "A request arrived from role://liaison. Coordinate the internal work needed to answer it. Use durable tasks and typed role messages when useful.",
       "Return a concise response for role://liaison containing questions, progress, blockers, decisions needed, or verified results. Do not address the user directly.",
+      "Do not call liaison_request or message_send for the final reply: return the reply as assistant text, and the caller will persist exactly one RESULT to the Liaison mailbox after this turn.",
       `Request message: ${JSON.stringify({ id: requestMessage.id, task_id: requestMessage.task_id, scope: requestMessage.scope, payload: { user_request: input.request } })}`
-    ].join("\n\n"));
-    const resultMessage = store.sendMessage(project, {
-      type: "RESULT",
-      from_role: "coordinator",
-      to_role: "liaison",
-      from_generation: coordinatorGeneration.generation_number,
-      ...(input.task_id ? { task_id: input.task_id } : {}),
-      scope: input.scope || "",
-      architecture_epoch: store.projectEpoch(project),
-      payload: { response: responseText },
-      reply_to: String(requestMessage.id)
-    });
-    store.acknowledgeMessage(project, "coordinator", String(requestMessage.id));
-    return { request_message: requestMessage, result_message: resultMessage, response: responseText };
-  } finally { client.close(); }
+    ].join("\n\n");
+  const runCoordinator = async (generation: GenerationRecord): Promise<string> => {
+    const client = options.clientFactory ? await options.clientFactory() : await AppServerClient.connect();
+    try { return await client.runTurn(generation.thread_id, prompt, options.timeoutMs); } finally { client.close(); }
+  };
+  let recovery: unknown = null;
+  let responseText: string;
+  try {
+    responseText = await runCoordinator(coordinatorGeneration);
+  } catch (error) {
+    if (!isMissingThreadError(error)) throw error;
+    recovery = await replaceMissingActiveGeneration(store, project, "coordinator", coordinatorGeneration, options.generationOptions || {});
+    coordinatorGeneration = store.activeGeneration(project, "coordinator");
+    if (!coordinatorGeneration) throw new Error("COORDINATOR_RECOVERY_FAILED");
+    responseText = await runCoordinator(coordinatorGeneration);
+  }
+  const resultMessage = store.sendMessage(project, {
+    type: "RESULT",
+    from_role: "coordinator",
+    to_role: "liaison",
+    from_generation: coordinatorGeneration.generation_number,
+    ...(input.task_id ? { task_id: input.task_id } : {}),
+    scope: input.scope || "",
+    architecture_epoch: store.projectEpoch(project),
+    payload: { response: responseText },
+    reply_to: String(requestMessage.id)
+  });
+  store.acknowledgeMessage(project, "coordinator", String(requestMessage.id));
+  return { startup, recovery, request_message: requestMessage, result_message: resultMessage, response: responseText };
 }

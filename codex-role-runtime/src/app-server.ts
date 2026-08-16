@@ -4,6 +4,11 @@ import { RolePolicy } from "./types.js";
 
 type Rpc = { id?: number | string; method?: string; params?: any; result?: any; error?: any };
 
+export function isMissingThreadError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /no rollout found|no codex thread found|thread(?: id)?[^\n]*not found|unknown thread/i.test(message);
+}
+
 export function resolveCodexBinary(): string {
   if (process.env.CODEX_BIN) {
     return process.env.CODEX_BIN;
@@ -36,8 +41,10 @@ export class AppServerClient {
     this.child.stderr.setEncoding("utf8");
     this.child.stderr.on("data", (chunk: string) => { this.stderr.push(chunk); if (this.stderr.length > 50) this.stderr.shift(); });
     this.child.on("exit", (code) => {
-      for (const waiter of this.pending.values()) { clearTimeout(waiter.timer); waiter.reject(new Error(`Codex app-server exited with ${code}. ${this.stderr.join("").slice(-2000)}`)); }
+      const error = new Error(`Codex app-server exited with ${code}. ${this.stderr.join("").slice(-2000)}`);
+      for (const waiter of this.pending.values()) { clearTimeout(waiter.timer); waiter.reject(error); }
       this.pending.clear();
+      for (const listener of [...this.listeners]) listener({ method: "app-server/exited", params: { error: error.message } });
     });
   }
 
@@ -88,28 +95,75 @@ export class AppServerClient {
     if (result?.thread?.id !== threadId) throw new Error(`thread/resume returned the wrong thread: ${JSON.stringify(result)}`);
   }
 
+  async threadExists(threadId: string): Promise<boolean> {
+    try {
+      // Existence checks must not resume/load the thread: resume acquires the
+      // App Server writer and can race the separate connection that runs work.
+      const result = await this.request("thread/read", { threadId, includeTurns: false }, 60_000);
+      return result?.thread?.id === threadId;
+    } catch (error) {
+      if (isMissingThreadError(error)) return false;
+      throw error;
+    }
+  }
+
   async runTurn(threadId: string, prompt: string, timeoutMs = 900_000): Promise<string> {
     await this.resumeThread(threadId);
     let lastText = "";
+    let cleanup = () => undefined;
     const completed = new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => { this.listeners.delete(listener); reject(new Error("Role dispatch turn timed out.")); }, timeoutMs);
+      const timer = setTimeout(() => { cleanup(); reject(new Error("Role dispatch turn timed out.")); }, timeoutMs);
       const listener = (message: Rpc) => {
         const params = message.params || {};
         if (params.threadId && params.threadId !== threadId) return;
+        if (message.method === "app-server/exited") {
+          cleanup();
+          reject(new Error(params.error || "Codex app-server exited during role dispatch."));
+          return;
+        }
         if (message.method === "item/agentMessage/delta") lastText += params.delta || "";
         if (message.method === "item/completed" && params.item?.type === "agentMessage") lastText = params.item.text || lastText;
         if (message.method === "turn/completed") {
-          clearTimeout(timer); this.listeners.delete(listener);
-          if (params.turn?.status && !["completed", "Completed"].includes(params.turn.status)) reject(new Error(`Role dispatch turn ${params.turn.status}`));
+          cleanup();
+          if (params.turn?.status && !["completed", "Completed"].includes(params.turn.status)) {
+            reject(new Error(`Role dispatch turn ${params.turn.status}${params.turn?.error?.message ? `: ${params.turn.error.message}` : ""}`));
+          }
           else resolve();
         }
       };
+      cleanup = () => { clearTimeout(timer); this.listeners.delete(listener); };
       this.listeners.add(listener);
     });
-    await this.request("turn/start", { threadId, input: [{ type: "text", text: prompt }] }, 60_000);
-    await completed;
-    return lastText.trim();
+    try {
+      await this.request("turn/start", { threadId, input: [{ type: "text", text: prompt }] }, 60_000);
+      await completed;
+      return lastText.trim();
+    } catch (error) {
+      cleanup();
+      throw error;
+    }
   }
 
-  close(): void { this.lines.close(); this.child.stdin.end(); this.child.kill(); }
+  close(): void {
+    this.lines.close();
+    if (this.child.exitCode !== null || this.child.killed) return;
+
+    // Closing stdin lets App Server release loaded-thread writer ownership.
+    // On Windows the spawned process may be a cmd.exe wrapper around codex.cmd;
+    // killing only that wrapper can orphan the real App Server and leave a
+    // permanent `active writer` lock, so force-kill the exact tree only after
+    // a short graceful-shutdown window.
+    this.child.stdin.end();
+    const timer = setTimeout(() => {
+      if (this.child.exitCode !== null) return;
+      if (process.platform === "win32" && this.child.pid) {
+        const killer = spawn("taskkill.exe", ["/pid", String(this.child.pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
+        killer.unref();
+      } else {
+        this.child.kill();
+      }
+    }, 2_000);
+    timer.unref();
+    this.child.once("exit", () => clearTimeout(timer));
+  }
 }

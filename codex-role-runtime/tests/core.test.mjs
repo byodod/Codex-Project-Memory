@@ -4,7 +4,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { dispatchRoleMessage, initializeStandardTopology, RoleStore, resolveProject, rotateRoleGeneration, startRoleGeneration } from "../dist/library.mjs";
+import { dispatchLiaisonRequest, dispatchRoleMessage, initializeStandardTopology, isMissingThreadError, RoleStore, resolveProject, rotateRoleGeneration, startRoleGeneration } from "../dist/library.mjs";
 
 function fixture() {
   const cwd = mkdtempSync(join(tmpdir(), "codex-role-project-"));
@@ -106,6 +106,68 @@ test("role_start activates deterministically and repeated calls are idempotent",
   } finally { store.close(); }
 });
 
+test("role_start replaces a missing active task and closes an incompatible stale rotation", async () => {
+  const { store, project } = fixture();
+  try {
+    const first = store.bindInitial(project, "architect", "thr-missing-1");
+    const staleRotation = store.createRotation(project, "architect", "abandoned rotation for generation 1");
+    const second = store.createCandidate(project, "architect", "thr-missing-2");
+    store.activateCandidate(project, "architect", second.id, "simulate a later cutover that left the old rotation open");
+
+    const created = [];
+    const recovered = await startRoleGeneration(store, project, "architect", {
+      taskExists: async (threadId) => { assert.equal(threadId, "thr-missing-2"); return false; },
+      clientFactory: async () => ({ async startThread() { created.push("thr-recovered"); return "thr-recovered"; }, close() {} })
+    });
+
+    assert.equal(recovered.status, "active");
+    assert.equal(recovered.started, true);
+    assert.equal(recovered.recovered, true);
+    assert.equal(recovered.generation.thread_id, "thr-recovered");
+    assert.equal(created.length, 1);
+    assert.equal(store.getGenerationByThread(project, first.thread_id).generation.status, "retired");
+    assert.equal(store.getGenerationByThread(project, second.thread_id).generation.status, "retired");
+    assert.equal(store.db.prepare("SELECT state FROM rotations WHERE id=?").get(staleRotation.id).state, "FAILED");
+    assert.equal(store.db.prepare("SELECT count(*) n FROM role_generations WHERE role_id=? AND status='active'").get(store.getRole(project, "architect").id).n, 1);
+  } finally { store.close(); }
+});
+
+test("liaison request recovers a missing Coordinator task before routing", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "codex-role-liaison-recovery-project-"));
+  const data = mkdtempSync(join(tmpdir(), "codex-role-liaison-recovery-data-"));
+  const store = new RoleStore(data); const project = resolveProject(cwd);
+  initializeStandardTopology(store, project);
+  store.bindInitial(project, "liaison", "thr-liaison");
+  store.bindInitial(project, "coordinator", "thr-coordinator-missing");
+  const turns = [];
+  try {
+    const result = await dispatchLiaisonRequest(store, project, {
+      liaison_generation: 1, request: "Confirm initialization and remain idle.", message_id: "liaison-recovery"
+    }, {
+      generationOptions: {
+        taskExists: async () => false,
+        clientFactory: async () => ({ async startThread() { return "thr-coordinator-recovered"; }, close() {} })
+      },
+      clientFactory: async () => ({ async runTurn(threadId, prompt) { turns.push({ threadId, prompt }); return "Initialization confirmed."; }, close() {} })
+    });
+
+    assert.equal(result.startup.recovered, true);
+    assert.equal(result.response, "Initialization confirmed.");
+    assert.equal(turns.length, 1);
+    assert.equal(turns[0].threadId, "thr-coordinator-recovered");
+    assert.match(turns[0].prompt, /Do not call liaison_request or message_send for the final reply/);
+    assert.equal(store.activeGeneration(project, "coordinator").generation_number, 2);
+    assert.equal(store.message(project, "liaison-recovery").status, "acknowledged");
+    assert.equal(store.db.prepare("SELECT count(*) n FROM messages WHERE reply_to=? AND type='RESULT'").get("liaison-recovery").n, 1);
+  } finally { store.close(); }
+});
+
+test("missing App Server task errors are classified narrowly", () => {
+  assert.equal(isMissingThreadError(new Error("App Server RPC error: No rollout found for thread id 123")), true);
+  assert.equal(isMissingThreadError(new Error("No Codex thread found for threadId: 123")), true);
+  assert.equal(isMissingThreadError(new Error("App Server timeout: thread/resume")), false);
+});
+
 test("failed startup rejects its candidate and a retry can create the next generation", async () => {
   const { store, project } = fixture();
   const originalActivate = store.activateCandidate.bind(store);
@@ -152,6 +214,7 @@ test("typed messages are idempotent and reject stale generation or architecture"
     store.acknowledgeMessage(project, "implementer", "msg-fixed");
     store.advanceArchitecture(project, "new boundary");
     assert.throws(() => store.sendMessage(project, { ...input, message_id: "msg-stale", architecture_epoch: 1 }), /STALE_ARCHITECTURE_EPOCH/);
+    assert.throws(() => store.sendMessage(project, { ...input, message_id: "msg-project-memory-task", architecture_epoch: 2, task_id: "task_from_project_memory" }), /ROLE_TASK_NOT_FOUND: task_id must reference a Role Runtime task/);
   } finally { store.close(); }
 });
 
@@ -204,11 +267,13 @@ test("failed role wake retries and result traffic never wakes Coordinator recurs
   };
   try {
     await assert.rejects(dispatchRoleMessage(store, project, input, {
+      generationOptions: { taskExists: async () => true },
       clientFactory: async () => ({ async runTurn() { throw new Error("temporary resume failure"); }, close() {} })
     }), /ROLE_WAKE_FAILED/);
     assert.equal(store.message(project, "wake-retry").wake_status, "failed");
 
     const retried = await dispatchRoleMessage(store, project, input, {
+      generationOptions: { taskExists: async () => true },
       clientFactory: async () => ({ async runTurn() { return "verified"; }, close() {} })
     });
     assert.equal(retried.wake.status, "completed");

@@ -1142,6 +1142,10 @@ var RoleStore = class {
     }
     this.assertCurrent(from, input.from_generation);
     if (input.architecture_epoch !== this.projectEpoch(project2)) throw new Error("STALE_ARCHITECTURE_EPOCH");
+    if (input.task_id) {
+      const task = this.db.prepare("SELECT id FROM tasks WHERE id=? AND project_id=?").get(input.task_id, project2.id);
+      if (!task) throw new Error("ROLE_TASK_NOT_FOUND: task_id must reference a Role Runtime task; put a Project Memory task id in payload.project_memory_task_id instead.");
+    }
     const id = input.message_id || newId2("msg");
     const time = nowIso2();
     this.db.prepare(`INSERT INTO messages(id,project_id,type,from_role_id,to_role_id,from_generation,task_id,scope,architecture_epoch,payload,evidence_refs,reply_to,status,created_at)
