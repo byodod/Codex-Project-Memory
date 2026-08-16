@@ -19,7 +19,7 @@ Use the `role_runtime` MCP tools as the authoritative control plane. Role identi
 
 ## Default one-prompt start
 
-When the user sends exactly `初始化角色编排`, `启动角色编排`, or `initialize role orchestration`, the `UserPromptSubmit` hook idempotently creates the standard Liaison, Coordinator, Architect, and Verifier topology and binds the current task to `role://liaison`.
+When the user sends exactly `初始化角色编排`, `启动角色编排`, or `initialize role orchestration`, the `UserPromptSubmit` hook idempotently creates the standard Liaison, Coordinator, Architect, and Verifier topology and binds the current task to `role://liaison`. If another Liaison task is active, the exact prompt deterministically hands the Liaison generation off to the current task and retires the old generation while reusing the existing Coordinator.
 
 The Hook starts the Coordinator itself before the Liaison model turn. After it binds the Liaison:
 

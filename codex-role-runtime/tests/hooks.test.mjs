@@ -30,8 +30,16 @@ test("one prompt initializes the standard topology and binds this task as the us
   store.close();
 
   const duplicate = invoke(cwd, data, { session_id: "thr-other", turn_id: "t0", cwd, hook_event_name: "UserPromptSubmit", prompt: "initialize role orchestration" });
-  assert.equal(duplicate.decision, "block");
-  assert.match(duplicate.reason, /USER_LIAISON_ALREADY_ACTIVE/);
+  assert.match(duplicate.hookSpecificOutput.additionalContext, /resumed and handed off/);
+  const afterHandoff = new RoleStore(data); const handedOffProject = resolveProject(cwd);
+  assert.equal(afterHandoff.activeGeneration(handedOffProject, "liaison").thread_id, "thr-other");
+  assert.equal(afterHandoff.activeGeneration(handedOffProject, "liaison").generation_number, 2);
+  assert.equal(afterHandoff.activeGeneration(handedOffProject, "coordinator").thread_id, "thr-test-coordinator");
+  assert.equal(afterHandoff.db.prepare("SELECT count(*) n FROM role_generations WHERE status='active'").get().n, 2);
+  afterHandoff.close();
+  const staleLiaison = invoke(cwd, data, { session_id: "thr-user", turn_id: "t2", cwd, hook_event_name: "UserPromptSubmit", prompt: "continue" });
+  assert.equal(staleLiaison.decision, "block");
+  assert.match(staleLiaison.reason, /STALE_GENERATION/);
 });
 
 test("ordinary prompts do not initialize or bind a role", () => {

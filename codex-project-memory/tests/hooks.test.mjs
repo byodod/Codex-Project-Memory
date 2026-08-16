@@ -73,12 +73,18 @@ test("integrated Hook merges project memory with role initialization and policy"
   };
   const initialized = invokeIntegrated({ session_id: "thr-integrated-user", turn_id: "t0", cwd, hook_event_name: "UserPromptSubmit", prompt: "初始化角色编排" });
   assert.match(initialized.hookSpecificOutput.additionalContext, /communication entry point/);
+  const handedOff = invokeIntegrated({ session_id: "thr-integrated-user-2", turn_id: "t0", cwd, hook_event_name: "UserPromptSubmit", prompt: "启动角色编排" });
+  assert.match(handedOff.hookSpecificOutput.additionalContext, /resumed and handed off/);
   const resumed = invokeIntegrated({ session_id: "thr-integrated-user", cwd, hook_event_name: "SessionStart", source: "resume" });
-  assert.match(resumed.hookSpecificOutput.additionalContext, /Integrated task/);
-  assert.match(resumed.hookSpecificOutput.additionalContext, /role:\/\/liaison/);
+  assert.equal(resumed.continue, false);
+  assert.match(resumed.stopReason, /STALE_GENERATION/);
+  const current = invokeIntegrated({ session_id: "thr-integrated-user-2", cwd, hook_event_name: "SessionStart", source: "resume" });
+  assert.match(current.hookSpecificOutput.additionalContext, /Integrated task/);
+  assert.match(current.hookSpecificOutput.additionalContext, /role:\/\/liaison/);
 
   const roleStore = new (await import("../dist/role-library.mjs")).RoleStore(roleData);
   const roleProject = (await import("../dist/role-library.mjs")).resolveProject(cwd);
   assert.equal(roleStore.activeGeneration(roleProject, "coordinator").thread_id, "thr-integrated-coordinator");
+  assert.equal(roleStore.activeGeneration(roleProject, "liaison").thread_id, "thr-integrated-user-2");
   roleStore.close();
 });

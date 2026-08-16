@@ -64,7 +64,7 @@ Restart Codex, open a new task in the project, and send:
 That single prompt:
 
 1. Creates the standard four-role topology idempotently.
-2. Permanently binds the current task to `role://liaison` as the user's entry point.
+2. Binds the current task to `role://liaison` as the user's entry point. Repeating the exact prompt from another task safely retires the old Liaison generation and hands the role off to the current task.
 3. The Hook itself starts and deterministically activates the first `role://coordinator` task through Codex App Server before the Liaison model turn begins.
 4. Keeps later user requests flowing through `liaison_request`, which wakes the Coordinator and returns its result to the Liaison.
 

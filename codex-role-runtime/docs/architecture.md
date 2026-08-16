@@ -15,7 +15,7 @@ The durable control plane owns identity, state, policy, routing, tasks, messages
 
 ## User interaction boundary
 
-`role://liaison` is the only role that converses with the user. An exact initialization prompt creates the standard topology, binds the current task as the Liaison, and lets the Liaison start the Coordinator with `role_start`. `liaison_request` persists the user request, wakes the active Coordinator generation through App Server, waits for its response, and persists that response back to the Liaison mailbox. The Coordinator routes internal work; internal roles never require direct user contact.
+`role://liaison` is the only role that converses with the user. An exact initialization prompt creates the standard topology, binds the current task as the Liaison, and lets the Liaison start the Coordinator with `role_start`. If another Liaison generation is already active, the exact prompt performs a deterministic handoff to the current task and retires the old generation without replacing the Coordinator. `liaison_request` persists the user request, wakes the active Coordinator generation through App Server, waits for its response, and persists that response back to the Liaison mailbox. The Coordinator routes internal work; internal roles never require direct user contact.
 
 ## Rotation transaction
 

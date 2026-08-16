@@ -978,6 +978,42 @@ async function rotateRoleGeneration(store, project, roleKey, reason, options = {
     client?.close();
   }
 }
+function handoffRoleGenerationToThread(store, project, roleKey, threadId, reason) {
+  const role = store.getRole(project, roleKey);
+  if (!role) throw new Error(`Unknown role: ${roleKey}`);
+  const active = store.activeGeneration(project, roleKey);
+  if (active?.thread_id === threadId) return { role: roleKey, status: "active", handed_off: false, generation: active };
+  if (store.getGenerationByThread(project, threadId)) throw new Error("THREAD_ALREADY_BOUND");
+  if (store.bootstrappingGeneration(project, roleKey) || store.openRotation(project, roleKey)) throw new Error("ROLE_ROTATION_ALREADY_IN_PROGRESS");
+  const rotation = store.createRotation(project, roleKey, reason);
+  let candidate = null;
+  try {
+    store.updateRotation(String(rotation.id), "DRAINING");
+    store.updateRotation(String(rotation.id), "CHECKPOINTING");
+    store.updateRotation(String(rotation.id), "VALIDATING");
+    const expected = expectedBootstrap(store, project, role);
+    candidate = store.createCandidate(project, roleKey, threadId, JSON.stringify(expected));
+    store.updateRotation(String(rotation.id), "BOOTSTRAPPING", { candidateId: candidate.id });
+    const validation = store.validateBootstrap(project, roleKey, expected);
+    if (!validation.ok) throw new Error(`Bootstrap rejected: ${validation.errors.join("; ")}`);
+    store.updateRotation(String(rotation.id), "CUTOVER");
+    const next = store.activateCandidate(project, roleKey, candidate.id, reason);
+    store.updateRotation(String(rotation.id), "COMPLETED");
+    return { rotation_id: rotation.id, role: roleKey, status: "active", handed_off: Boolean(active), generation: next, validation };
+  } catch (error) {
+    if (candidate) {
+      try {
+        store.rejectCandidate(candidate.id, `Existing-thread handoff failed: ${error instanceof Error ? error.message : String(error)}`);
+      } catch {
+      }
+    }
+    try {
+      store.updateRotation(String(rotation.id), "FAILED", { error: error instanceof Error ? error.message : String(error) });
+    } catch {
+    }
+    throw error;
+  }
+}
 async function startRoleGeneration(store, project, roleKey, options = {}) {
   const active = store.activeGeneration(project, roleKey);
   if (active) return { role: roleKey, status: "active", started: false, generation: active };
@@ -1047,6 +1083,7 @@ export {
   compactText,
   dispatchLiaisonRequest,
   expectedBootstrap,
+  handoffRoleGenerationToThread,
   initializeStandardTopology,
   isRoleInitializationPrompt,
   matchesAny,

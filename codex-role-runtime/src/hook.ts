@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { startRoleGeneration } from "./generation-service.js";
+import { handoffRoleGenerationToThread, startRoleGeneration } from "./generation-service.js";
 import { resolveProject } from "./project.js";
 import { RoleStore } from "./store.js";
 import { initializeStandardTopology, isRoleInitializationPrompt } from "./topology.js";
@@ -37,16 +37,15 @@ try {
     if (isRoleInitializationPrompt(input.prompt)) {
       initializeStandardTopology(store, project);
       const active = store.activeGeneration(project, "liaison");
-      if (active && active.thread_id !== input.session_id) {
-        process.stdout.write(JSON.stringify(deny(input.hook_event_name, "USER_LIAISON_ALREADY_ACTIVE: continue the existing User Liaison task, or rotate role://liaison before binding this task.")));
-        process.exit(0);
-      }
-      const generation = store.bindInitial(project, "liaison", input.session_id);
+      const liaison = active
+        ? handoffRoleGenerationToThread(store, project, "liaison", input.session_id, "User selected a new Liaison entry task with the exact initialization prompt.")
+        : { handed_off: false, generation: store.bindInitial(project, "liaison", input.session_id) };
       const testCoordinatorThread = process.env.CODEX_ROLE_RUNTIME_TEST_COORDINATOR_THREAD;
       const coordinator = await startRoleGeneration(store, project, "coordinator", testCoordinatorThread ? {
         clientFactory: async () => ({ async startThread() { return testCoordinatorThread; }, close() {} })
       } : {});
-      process.stdout.write(JSON.stringify(context(input.hook_event_name, `Role orchestration initialized. This task is the user's communication entry point; role://coordinator status is ${(coordinator as Record<string, unknown>).status}.\n${store.roleAnchor(project, "liaison")}\nSend structured user intent to role://coordinator; relay its questions, progress, blockers, and verified results back to the user.`)));
+      const action = (liaison as Record<string, unknown>).handed_off ? "resumed and handed off" : "initialized";
+      process.stdout.write(JSON.stringify(context(input.hook_event_name, `Role orchestration ${action}. This task is now the user's communication entry point; role://coordinator status is ${(coordinator as Record<string, unknown>).status}.\n${store.roleAnchor(project, "liaison")}\nSend structured user intent to role://coordinator; relay its questions, progress, blockers, and verified results back to the user.`)));
       process.exit(0);
     }
     const claim = input.prompt?.match(/^\s*role:\/\/bind\s+([a-z0-9-]+)\s*$/i);

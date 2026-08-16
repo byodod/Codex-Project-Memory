@@ -34,7 +34,7 @@ sh ./scripts/install.sh
 
 Then restart Codex and begin a new task. Plugin hooks are non-managed code: open `/hooks`, inspect them, and trust the current definitions. The plugin exposes `project_memory` and `role_runtime` MCP servers.
 
-To initialize the default role topology, send `初始化角色编排`. The integrated Hook binds the current task as `role://liaison` and deterministically starts `role://coordinator` before the Liaison model turn begins.
+To initialize the default role topology, send `初始化角色编排`. The integrated Hook binds the current task as `role://liaison` and deterministically starts `role://coordinator` before the Liaison model turn begins. Repeating the exact prompt from another task safely hands the Liaison generation off to that task and reuses the existing Coordinator.
 
 ## Normal Codex workflow
 

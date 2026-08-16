@@ -190,6 +190,42 @@ async function rotateRoleGeneration(store2, project, roleKey, reason, options = 
     client?.close();
   }
 }
+function handoffRoleGenerationToThread(store2, project, roleKey, threadId, reason) {
+  const role = store2.getRole(project, roleKey);
+  if (!role) throw new Error(`Unknown role: ${roleKey}`);
+  const active = store2.activeGeneration(project, roleKey);
+  if (active?.thread_id === threadId) return { role: roleKey, status: "active", handed_off: false, generation: active };
+  if (store2.getGenerationByThread(project, threadId)) throw new Error("THREAD_ALREADY_BOUND");
+  if (store2.bootstrappingGeneration(project, roleKey) || store2.openRotation(project, roleKey)) throw new Error("ROLE_ROTATION_ALREADY_IN_PROGRESS");
+  const rotation = store2.createRotation(project, roleKey, reason);
+  let candidate = null;
+  try {
+    store2.updateRotation(String(rotation.id), "DRAINING");
+    store2.updateRotation(String(rotation.id), "CHECKPOINTING");
+    store2.updateRotation(String(rotation.id), "VALIDATING");
+    const expected = expectedBootstrap(store2, project, role);
+    candidate = store2.createCandidate(project, roleKey, threadId, JSON.stringify(expected));
+    store2.updateRotation(String(rotation.id), "BOOTSTRAPPING", { candidateId: candidate.id });
+    const validation = store2.validateBootstrap(project, roleKey, expected);
+    if (!validation.ok) throw new Error(`Bootstrap rejected: ${validation.errors.join("; ")}`);
+    store2.updateRotation(String(rotation.id), "CUTOVER");
+    const next = store2.activateCandidate(project, roleKey, candidate.id, reason);
+    store2.updateRotation(String(rotation.id), "COMPLETED");
+    return { rotation_id: rotation.id, role: roleKey, status: "active", handed_off: Boolean(active), generation: next, validation };
+  } catch (error) {
+    if (candidate) {
+      try {
+        store2.rejectCandidate(candidate.id, `Existing-thread handoff failed: ${error instanceof Error ? error.message : String(error)}`);
+      } catch {
+      }
+    }
+    try {
+      store2.updateRotation(String(rotation.id), "FAILED", { error: error instanceof Error ? error.message : String(error) });
+    } catch {
+    }
+    throw error;
+  }
+}
 async function startRoleGeneration(store2, project, roleKey, options = {}) {
   const active = store2.activeGeneration(project, roleKey);
   if (active) return { role: roleKey, status: "active", started: false, generation: active };
@@ -994,11 +1030,7 @@ try {
     if (isRoleInitializationPrompt(input.prompt)) {
       initializeStandardTopology(store, project);
       const active = store.activeGeneration(project, "liaison");
-      if (active && active.thread_id !== input.session_id) {
-        process.stdout.write(JSON.stringify(deny(input.hook_event_name, "USER_LIAISON_ALREADY_ACTIVE: continue the existing User Liaison task, or rotate role://liaison before binding this task.")));
-        process.exit(0);
-      }
-      const generation2 = store.bindInitial(project, "liaison", input.session_id);
+      const liaison = active ? handoffRoleGenerationToThread(store, project, "liaison", input.session_id, "User selected a new Liaison entry task with the exact initialization prompt.") : { handed_off: false, generation: store.bindInitial(project, "liaison", input.session_id) };
       const testCoordinatorThread = process.env.CODEX_ROLE_RUNTIME_TEST_COORDINATOR_THREAD;
       const coordinator = await startRoleGeneration(store, project, "coordinator", testCoordinatorThread ? {
         clientFactory: async () => ({ async startThread() {
@@ -1006,7 +1038,8 @@ try {
         }, close() {
         } })
       } : {});
-      process.stdout.write(JSON.stringify(context(input.hook_event_name, `Role orchestration initialized. This task is the user's communication entry point; role://coordinator status is ${coordinator.status}.
+      const action = liaison.handed_off ? "resumed and handed off" : "initialized";
+      process.stdout.write(JSON.stringify(context(input.hook_event_name, `Role orchestration ${action}. This task is now the user's communication entry point; role://coordinator status is ${coordinator.status}.
 ${store.roleAnchor(project, "liaison")}
 Send structured user intent to role://coordinator; relay its questions, progress, blockers, and verified results back to the user.`)));
       process.exit(0);

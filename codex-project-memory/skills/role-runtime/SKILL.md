@@ -14,7 +14,7 @@ Do not use a host/global memory summary as a substitute for the repository-scope
 When the user sends exactly `初始化角色编排`, `启动角色编排`, or `initialize role orchestration`, the integrated Hook must:
 
 1. Idempotently create Liaison, Coordinator, Architect, and Verifier roles.
-2. Bind the current task to `role://liaison`, the only user-facing role.
+2. Bind the current task to `role://liaison`, the only user-facing role. If another Liaison task is active, deterministically hand the Liaison generation off to the current task and retire the old generation.
 3. Create and deterministically activate the Coordinator task before the Liaison model turn begins.
 
 Afterward, call both `role_runtime.status` and `project_memory.task_get` with the current `cwd`. If the Coordinator startup was interrupted, call the idempotent `role_start`; do not ask the user to repair it. If no matching project-memory task exists for substantive work, create one with `task_upsert`.

@@ -1,6 +1,6 @@
 {
   "name": "codex-role-runtime",
-  "version": "1.0.0+codex.20260816191328",
+  "version": "1.0.0+codex.20260816193546",
   "description": "One-prompt role orchestration with a user-facing Liaison, persistent roles, typed routing, and replaceable Codex task generations.",
   "author": {
     "name": "Local developer"
