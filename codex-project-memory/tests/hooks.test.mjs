@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -17,6 +17,11 @@ function invoke(input, dataHome, cwd) {
   assert.equal(run.status, 0, run.stderr);
   return run.stdout.trim() ? JSON.parse(run.stdout) : null;
 }
+
+test("only the selected lifecycle hooks are registered for automatic execution", () => {
+  const hooks = JSON.parse(readFileSync("hooks/hooks.json", "utf8"));
+  assert.deepEqual(Object.keys(hooks.hooks).sort(), ["PostCompact", "SessionStart", "Stop"].sort());
+});
 
 test("hooks rehydrate, prompt-recall, checkpoint, redact secrets, and gate incomplete tasks", () => {
   const cwd = mkdtempSync(join(tmpdir(), "codex-memory-hook-project-"));

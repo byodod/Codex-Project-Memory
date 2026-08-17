@@ -37,7 +37,7 @@ The bundled `project-memory` skill applies to substantial multi-step engineering
 3. `task_upsert` stores the active work item, acceptance state, blockers, and first-class `exact_next_action`. Semantic changes increment `version`.
 4. `memory_search` recalls relevant decisions, failures, paths, symbols, and error signatures; `memory_store` writes only durable, provenance-labelled information.
 5. `verification_record` binds objective evidence to the current plan revision, task version, Git revision, and workspace digest.
-6. `task_checkpoint` materializes the deterministic Mainline Capsule before a handoff; `PreCompact` does this automatically.
+6. `task_checkpoint` materializes the deterministic Mainline Capsule before a handoff; it can be called explicitly when a checkpoint is needed.
 7. `task_complete` succeeds only when the completion gate is satisfied.
 
 `NONE` means a field was checked and is empty. `UNKNOWN` means it could not be established and must not be treated as empty. Verification is explicitly labelled `CURRENT`, `STALE`, `NONE_CURRENT`, or `UNKNOWN`.
@@ -81,18 +81,14 @@ The reset cannot be undone by the plugin. Start a new Codex task afterward to re
 
 | Hook | Behavior |
 |---|---|
+| `PostCompact(manual/auto)` | Record the compaction lifecycle event; it does not add context by itself |
 | `SessionStart(startup/resume/clear/compact)` | Rebuild and inject the Mainline Capsule from canonical SQLite and current Git state |
-| `UserPromptSubmit` | Recall memory relevant to the new request |
-| Ordinary tool calls | Do not inject project memory context |
-| `PostToolUse` | Capture bounded, redacted objective evidence and low-importance failures |
-| `PreCompact` | Save an idempotent atomic checkpoint and `last_good_capsule.json`; never calls an LLM |
-| `PostCompact` | Record telemetry only; it is not an injection point |
 | `Stop` | Enforce the opt-in project completion gate |
-| `SessionEnd` | Refresh human-readable exports |
+| Other lifecycle events | Not registered automatically; the MCP server and CLI remain available for explicit operations |
 
 After compaction, Codex emits `SessionStart` with `source=compact`; the Hook immediately rebuilds the capsule from the database and current repository state before the next model request. It never summarizes the preceding capsule or compact summary. If current materialization fails, the last digest-verified checkpoint is injected in explicit `degraded` mode. Hook-injected memory is historical context, never a higher-priority instruction source.
 
-The normal Project Memory injection target is bounded to 6,500 characters; compact recovery is bounded to 6,000 and prompt recall to 4,000. Ordinary tool calls do not add a memory context injection. This keeps the absolute memory budget small for both 128k and 256k context models.
+The normal Project Memory injection target is bounded to 6,500 characters; compact recovery is bounded to 6,000. Ordinary tool calls and user prompts do not add automatic memory context injections. This keeps the absolute memory budget small for both 128k and 256k context models.
 
 ## Storage
 
