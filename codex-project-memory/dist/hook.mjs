@@ -1248,13 +1248,6 @@ async function run(input) {
         const context = renderMemories(memories, "Relevant project memory", 4e3);
         return context ? hookContext("UserPromptSubmit", context) : null;
       }
-      case "PreToolUse": {
-        const safeInput = redact(input.tool_input);
-        const query = `${input.tool_name ?? ""} ${compactText(safeInput, 5e3)}`;
-        const memories = store.search(project, query, { taskId: task?.id, limit: 5 });
-        const context = renderMemories(memories, "Memory relevant to the pending tool call", 2600);
-        return context ? hookContext("PreToolUse", context) : null;
-      }
       case "PostToolUse": {
         const safeInput = redact(input.tool_input);
         const safeResponse = redact(input.tool_response);
@@ -1272,7 +1265,7 @@ async function run(input) {
           errorSignature: error,
           authority: "tool_observation"
         });
-        if (error && exitCode !== 0) {
+        if (error && exitCode !== null && exitCode !== 0) {
           store.storeMemory(project, {
             task_id: task?.id,
             kind: "episodic",

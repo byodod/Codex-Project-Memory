@@ -28,17 +28,17 @@ if (!resetSkillUi.includes('display_name: "Reset Project Memory"') || !resetSkil
 }
 if (!mcp.mcpServers?.project_memory?.args?.some((value) => value.includes("process.env.PLUGIN_ROOT"))) throw new Error("MCP entry must resolve from the PLUGIN_ROOT environment.");
 if (Object.keys(mcp.mcpServers ?? {}).join(",") !== "project_memory") throw new Error("Only the project_memory MCP server may be packaged.");
-for (const event of ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact", "PostCompact", "Stop", "SessionEnd"]) {
+for (const event of ["SessionStart", "UserPromptSubmit", "PostToolUse", "PreCompact", "PostCompact", "Stop", "SessionEnd"]) {
   if (!hooks.hooks[event]?.length) throw new Error(`Missing ${event} hook.`);
 }
+if (hooks.hooks.PreToolUse?.length) throw new Error("PreToolUse must not be registered; ordinary tool calls must not inject memory context.");
 const sessionEndHandlers = hooks.hooks.SessionEnd.flatMap((registration) => registration.hooks || []);
 if (sessionEndHandlers.some((hook) => hook.timeout === undefined || hook.timeout > 3)) {
   throw new Error("SessionEnd Hook timeout must be explicitly set to at most 3 seconds.");
 }
 const contextLimits = {
   SessionStart: 6500,
-  UserPromptSubmit: 4000,
-  PreToolUse: 2600
+  UserPromptSubmit: 4000
 };
 for (const [event, maximum] of Object.entries(contextLimits)) {
   const handlers = hooks.hooks[event].flatMap((registration) => registration.hooks || []);

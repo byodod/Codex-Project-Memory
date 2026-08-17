@@ -88,13 +88,6 @@ async function run(input: HookInput): Promise<object | null> {
         const context = renderMemories(memories, "Relevant project memory", 4000);
         return context ? hookContext("UserPromptSubmit", context) : null;
       }
-      case "PreToolUse": {
-        const safeInput = redact(input.tool_input);
-        const query = `${input.tool_name ?? ""} ${compactText(safeInput, 5000)}`;
-        const memories = store.search(project, query, { taskId: task?.id, limit: 5 });
-        const context = renderMemories(memories, "Memory relevant to the pending tool call", 2600);
-        return context ? hookContext("PreToolUse", context) : null;
-      }
       case "PostToolUse": {
         const safeInput = redact(input.tool_input);
         const safeResponse = redact(input.tool_response);
@@ -105,7 +98,7 @@ async function run(input: HookInput): Promise<object | null> {
           eventType: "tool_result", payload: { tool_name: input.tool_name, input: safeInput, response: safeResponse },
           exitCode, filePath: extractFile(input.tool_input), errorSignature: error, authority: "tool_observation"
         });
-        if (error && exitCode !== 0) {
+        if (error && exitCode !== null && exitCode !== 0) {
           store.storeMemory(project, {
             task_id: task?.id, kind: "episodic", summary: `Observed failure in ${input.tool_name ?? "tool"}`,
             content: error, authority: "tool_observation", confidence: 0.95, importance: 0.35,

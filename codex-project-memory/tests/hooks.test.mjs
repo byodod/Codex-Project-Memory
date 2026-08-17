@@ -18,7 +18,7 @@ function invoke(input, dataHome, cwd) {
   return run.stdout.trim() ? JSON.parse(run.stdout) : null;
 }
 
-test("hooks rehydrate, recall, checkpoint, redact secrets, and gate incomplete tasks", () => {
+test("hooks rehydrate, prompt-recall, checkpoint, redact secrets, and gate incomplete tasks", () => {
   const cwd = mkdtempSync(join(tmpdir(), "codex-memory-hook-project-"));
   const data = mkdtempSync(join(tmpdir(), "codex-memory-hook-data-"));
   const store = new MemoryStore(data);
@@ -48,9 +48,21 @@ test("hooks rehydrate, recall, checkpoint, redact secrets, and gate incomplete t
   assert.match(compactStart.hookSpecificOutput.additionalContext, /Long refactor/);
   assert.match(compactStart.hookSpecificOutput.additionalContext, /Exact next action: run npm test/);
   assert.ok(compactStart.hookSpecificOutput.additionalContext.length <= 6000);
-  const recall = invoke({ session_id: "s1", turn_id: "t1", cwd, hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "run LegacyBuilder" } }, data, cwd);
+  const recall = invoke({ session_id: "s1", turn_id: "t1", cwd, hook_event_name: "UserPromptSubmit", prompt: "Should I run LegacyBuilder?" }, data, cwd);
   assert.match(recall.hookSpecificOutput.additionalContext, /corrupts fixtures/);
+  assert.equal(invoke({ session_id: "s1", turn_id: "t1", cwd, hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "run LegacyBuilder" } }, data, cwd), null);
+  const failureSummary = "Observed failure in Bash";
+  const failureCount = () => {
+    const check = new MemoryStore(data);
+    const count = check.db.prepare("SELECT count(*) n FROM memories WHERE project_id=? AND task_id=? AND summary=?").get(project.id, task.id, failureSummary).n;
+    check.close();
+    return count;
+  };
+  const beforeUnknownExit = failureCount();
+  invoke({ session_id: "s1", turn_id: "t1", cwd, hook_event_name: "PostToolUse", tool_name: "Bash", tool_use_id: "tool-success", tool_input: { command: "test" }, tool_response: { output: "Successful report: Error and failure are quoted terms, not a failed command." } }, data, cwd);
+  assert.equal(failureCount(), beforeUnknownExit);
   invoke({ session_id: "s1", turn_id: "t1", cwd, hook_event_name: "PostToolUse", tool_name: "Bash", tool_use_id: "tool1", tool_input: { command: "test", token: "sk-abcdefghijklmnopqrstuvwxyz" }, tool_response: { exit_code: 1, output: "FATAL error CS0117 sk-abcdefghijklmnopqrstuvwxyz" } }, data, cwd);
+  assert.equal(failureCount(), beforeUnknownExit + 1);
   invoke({ session_id: "s1", turn_id: "t1", cwd, hook_event_name: "PreCompact", trigger: "auto" }, data, cwd);
   invoke({ session_id: "s1", turn_id: "t1", cwd, hook_event_name: "PreCompact", trigger: "auto" }, data, cwd);
   assert.equal(invoke({ session_id: "s1", turn_id: "t1", cwd, hook_event_name: "PostCompact", trigger: "auto" }, data, cwd), null);

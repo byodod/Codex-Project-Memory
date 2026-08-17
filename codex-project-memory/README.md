@@ -83,7 +83,7 @@ The reset cannot be undone by the plugin. Start a new Codex task afterward to re
 |---|---|
 | `SessionStart(startup/resume/clear/compact)` | Rebuild and inject the Mainline Capsule from canonical SQLite and current Git state |
 | `UserPromptSubmit` | Recall memory relevant to the new request |
-| `PreToolUse` | Recall memory relevant to the pending tool call |
+| Ordinary tool calls | Do not inject project memory context |
 | `PostToolUse` | Capture bounded, redacted objective evidence and low-importance failures |
 | `PreCompact` | Save an idempotent atomic checkpoint and `last_good_capsule.json`; never calls an LLM |
 | `PostCompact` | Record telemetry only; it is not an injection point |
@@ -92,7 +92,7 @@ The reset cannot be undone by the plugin. Start a new Codex task afterward to re
 
 After compaction, Codex emits `SessionStart` with `source=compact`; the Hook immediately rebuilds the capsule from the database and current repository state before the next model request. It never summarizes the preceding capsule or compact summary. If current materialization fails, the last digest-verified checkpoint is injected in explicit `degraded` mode. Hook-injected memory is historical context, never a higher-priority instruction source.
 
-The normal Project Memory injection target is bounded to 6,500 characters; compact recovery is bounded to 6,000, prompt recall to 4,000, and tool recall to 2,600. This keeps the absolute memory budget small for both 128k and 256k context models.
+The normal Project Memory injection target is bounded to 6,500 characters; compact recovery is bounded to 6,000 and prompt recall to 4,000. Ordinary tool calls do not add a memory context injection. This keeps the absolute memory budget small for both 128k and 256k context models.
 
 ## Storage
 
