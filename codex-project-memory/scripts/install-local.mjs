@@ -11,6 +11,7 @@ const target = join(pluginParent, "codex-project-memory");
 const codexHome = process.env.CODEX_HOME || join(homedir(), ".codex");
 const pluginData = join(codexHome, "plugin-data", "codex-project-memory");
 const roleData = join(codexHome, "plugin-data", "codex-role-runtime");
+const legacyRolePlugin = join(pluginParent, "codex-role-runtime");
 const marketplacePath = join(homedir(), ".agents", "plugins", "marketplace.json");
 const timestamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
 const staging = join(pluginParent, `.codex-project-memory.stage-${process.pid}`);
@@ -37,34 +38,16 @@ const installedMcp = {
       command: "node",
       args: ["--no-warnings", join(target, "dist", "mcp-server.mjs")],
       env: { CODEX_PROJECT_MEMORY_HOME: pluginData }
-    },
-    role_runtime: {
-      command: "node",
-      args: ["--no-warnings", join(target, "dist", "role-mcp-server.mjs")],
-      env: { CODEX_ROLE_RUNTIME_HOME: roleData }
     }
   }
 };
 await writeFile(join(target, ".mcp.json"), `${JSON.stringify(installedMcp, null, 2)}\n`, "utf8");
 
-await mkdir(dirname(marketplacePath), { recursive: true });
-let marketplace = { name: "personal", interface: { displayName: "Personal" }, plugins: [] };
-if (existsSync(marketplacePath)) marketplace = JSON.parse(await readFile(marketplacePath, "utf8"));
-marketplace.interface ||= { displayName: "Personal" };
-marketplace.plugins ||= [];
+if (!existsSync(marketplacePath)) throw new Error(`Personal marketplace is missing: ${marketplacePath}`);
+const marketplace = JSON.parse(await readFile(marketplacePath, "utf8"));
+const marketplaceEntry = marketplace.plugins?.find((item) => item.name === "codex-project-memory");
+if (!marketplaceEntry) throw new Error("The personal marketplace does not contain codex-project-memory. Scaffold the marketplace entry before running the update installer.");
 const removeLegacy = spawnSync("codex", ["plugin", "remove", `codex-role-runtime@${marketplace.name}`], { encoding: "utf8", shell: process.platform === "win32" });
-marketplace.plugins = marketplace.plugins.filter((item) => item.name !== "codex-role-runtime");
-const entry = {
-  name: "codex-project-memory",
-  source: { source: "local", path: "./plugins/codex-project-memory" },
-  policy: { installation: "AVAILABLE", authentication: "ON_INSTALL" },
-  category: "Developer Tools"
-};
-const index = marketplace.plugins.findIndex((item) => item.name === entry.name);
-if (index >= 0) marketplace.plugins[index] = entry; else marketplace.plugins.push(entry);
-const marketTemp = `${marketplacePath}.${process.pid}.tmp`;
-await writeFile(marketTemp, `${JSON.stringify(marketplace, null, 2)}\n`, "utf8");
-await rename(marketTemp, marketplacePath);
 
 const add = spawnSync("codex", ["plugin", "add", `codex-project-memory@${marketplace.name}`], {
   stdio: "inherit", shell: process.platform === "win32"
@@ -75,7 +58,9 @@ if (add.status !== 0) {
 }
 
 process.stdout.write(`Installed Codex Project Memory from ${target}\nMarketplace: ${marketplacePath}\n`);
-process.stdout.write(`Integrated Role Runtime data remains at ${roleData}\n`);
-if (removeLegacy.status === 0) process.stdout.write("Removed the duplicate standalone codex-role-runtime installation; its durable data was preserved.\n");
+await rm(roleData, { recursive: true, force: true });
+await rm(legacyRolePlugin, { recursive: true, force: true });
+process.stdout.write(`Removed legacy Role Runtime data from ${roleData}\n`);
+if (removeLegacy.status === 0) process.stdout.write("Removed the standalone codex-role-runtime installation.\n");
 if (existsSync(backup)) process.stdout.write(`Previous plugin copy preserved at ${backup}\n`);
 process.stdout.write("Restart Codex, start a new task, and review/trust the plugin hooks with /hooks.\n");

@@ -1,7 +1,5 @@
 import { MemoryStore } from "./storage.js";
 import { resolveProject } from "./repository.js";
-import { RoleStore } from "../../codex-role-runtime/src/store.js";
-import { resolveProject as resolveRoleProject } from "../../codex-role-runtime/src/project.js";
 import { resolve } from "node:path";
 
 const [command = "status", ...rest] = process.argv.slice(2);
@@ -39,17 +37,12 @@ try {
       if (!confirmedRoot || resolve(confirmedRoot).toLowerCase() !== canonicalRoot.toLowerCase()) {
         throw new Error(`RESET_CONFIRMATION_REQUIRED: rerun with --confirm-root "${project.root}"`);
       }
-      const roleStore = new RoleStore();
-      try {
-        const roleProject = resolveRoleProject(cwd);
-        output = {
-          ok: true,
-          root: project.root,
-          role_runtime: roleStore.resetProject(roleProject),
-          project_memory: store.resetProject(project),
-          next: "Start a new Codex task and send 初始化角色编排 to rebuild from zero."
-        };
-      } finally { roleStore.close(); }
+      output = {
+        ok: true,
+        root: project.root,
+        project_memory: store.resetProject(project),
+        next: "Start a new Codex task to rebuild project memory from zero."
+      };
       break;
     }
     default:

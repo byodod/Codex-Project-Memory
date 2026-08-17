@@ -7,14 +7,6 @@
         "--eval",
         "const p=require('node:path'),u=require('node:url');const r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','mcp-server.mjs')).href)"
       ]
-    },
-    "role_runtime": {
-      "command": "node",
-      "args": [
-        "--no-warnings",
-        "--eval",
-        "const p=require('node:path'),u=require('node:url');const r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','role-mcp-server.mjs')).href)"
-      ]
     }
   }
 }
