@@ -1,6 +1,6 @@
 ---
 name: reset-project
-description: Permanently clear the current project's complete Codex Project Memory state, including tasks, memories, events, verifications, checkpoints, and generated exports. Use only when the user explicitly invokes this reset skill or clearly asks to make the current project's memory start from zero. Never invoke implicitly for ordinary cleanup, task completion, or partial memory deletion.
+description: Permanently clear the current project's complete Codex Project Memory state, including plans, tasks, memories, events, verifications, checkpoints, capsules, and generated exports. Use only when the user explicitly invokes this reset skill or clearly asks to make the current project's memory start from zero. Never invoke implicitly for ordinary cleanup, task completion, or partial memory deletion.
 ---
 
 # Reset Project Memory

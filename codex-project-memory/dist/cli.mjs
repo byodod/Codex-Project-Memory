@@ -2,7 +2,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
-import { mkdirSync as mkdirSync2, rmSync } from "node:fs";
+import { existsSync, mkdirSync as mkdirSync2, readFileSync, rmSync } from "node:fs";
 
 // src/util.ts
 import { createHash, randomUUID } from "node:crypto";
@@ -47,21 +47,109 @@ function markdownEscape(value) {
   return value.replace(/[<>]/g, (char) => char === "<" ? "&lt;" : "&gt;");
 }
 
+// src/render.ts
+function stateList(value, limit = 12) {
+  if (typeof value === "string") return [value];
+  return value.slice(0, limit);
+}
+function appendSection(lines, heading, values, maxChars) {
+  const candidate = ["", `## ${heading}`, ...values.map((value) => `- ${compactText(value, 1e3)}`)];
+  for (const line of candidate) {
+    if ([...lines, line].join("\n").length > maxChars) {
+      const marker = "- \u2026[capsule budget reached; use mainline_get for full state]";
+      if ([...lines, marker].join("\n").length <= maxChars) lines.push(marker);
+      return;
+    }
+    lines.push(line);
+  }
+}
+function renderMainlineCapsule(capsule, maxChars = 6500) {
+  const work = capsule.active_work_item;
+  const plan = capsule.active_plan;
+  const verification = capsule.latest_valid_verification;
+  const lines = [
+    "# Project Memory Mainline Capsule",
+    "Historical working state only. Current user instructions and repository authority take precedence.",
+    `Recovery: ${capsule.recovery_mode}${capsule.degraded_reason ? ` (${capsule.degraded_reason})` : ""}`,
+    `Project: ${compactText(capsule.project.name, 200)} (${capsule.project.id})`,
+    `Project goal: ${compactText(capsule.project_goal, 1e3)}`,
+    `Plan: ${plan === "UNKNOWN" ? "UNKNOWN" : `${plan.id} revision=${plan.revision} status=${plan.status}`}`,
+    `Milestone: ${compactText(capsule.current_milestone, 500)}`,
+    `Work item: ${work === "UNKNOWN" ? "UNKNOWN" : `${compactText(work.title, 300)} (${work.id}; version=${work.version}; plan_revision=${work.plan_revision ?? "UNKNOWN"})`}`,
+    `Exact next action: ${compactText(capsule.exact_next_action, 700)}`,
+    `Verification: ${verification.freshness}/${verification.status} \u2014 ${compactText(verification.command_or_criterion, 500)}`,
+    `Repository: branch=${capsule.repository.branch}; revision=${capsule.repository.revision}; state=${capsule.repository.state}; workspace=${capsule.repository.workspace_digest}`,
+    `Checkpoint: ${capsule.checkpoint === "NONE" ? "NONE" : `${capsule.checkpoint.id} at ${capsule.checkpoint.created_at}`}`
+  ];
+  if (work !== "UNKNOWN") {
+    const criteria = work.acceptance_criteria.map((item) => `${work.completed_items.includes(item) ? "[x]" : "[ ]"} ${item}`);
+    appendSection(lines, "Acceptance criteria", criteria.length ? criteria : ["NONE"], maxChars);
+  }
+  appendSection(lines, "Blockers", stateList(capsule.blockers), maxChars);
+  appendSection(lines, "Definition of done", stateList(capsule.definition_of_done), maxChars);
+  appendSection(lines, "Critical constraints", stateList(capsule.critical_constraints), maxChars);
+  appendSection(lines, "Open user decisions", stateList(capsule.open_user_decisions), maxChars);
+  appendSection(lines, "Latest verification evidence", [
+    `freshness=${verification.freshness}; status=${verification.status}; at=${verification.created_at ?? "UNKNOWN"}`,
+    verification.evidence
+  ], maxChars);
+  appendSection(lines, "Do not repeat", [capsule.recent_failed_approach], maxChars);
+  return lines.join("\n").slice(0, maxChars);
+}
+
 // src/storage.ts
-function dataRoot(explicit) {
+function resolveMemoryDataRoot(explicit) {
   const codexHome = process.env.CODEX_HOME || join(homedir(), ".codex");
   return explicit || process.env.CODEX_PROJECT_MEMORY_HOME || process.env.PLUGIN_DATA || join(codexHome, "plugin-data", "codex-project-memory");
+}
+function readLastGoodCapsuleFile(root, project2) {
+  const path = join(root, "projects", project2.id, "last_good_capsule.json");
+  if (!existsSync(path)) return null;
+  try {
+    const stored = JSON.parse(readFileSync(path, "utf8"));
+    if (!stored.capsule || !stored.capsule_digest || !stored.rendered) return null;
+    const rendered = renderMainlineCapsule(stored.capsule, 6500);
+    if (rendered !== stored.rendered || sha256(rendered) !== stored.capsule_digest) return null;
+    return { ...stored.capsule, recovery_mode: "degraded", degraded_reason: "using last valid checkpoint" };
+  } catch {
+    return null;
+  }
 }
 function taskFromRow(row) {
   if (!row) return null;
   return {
     ...row,
     status: row.status,
+    plan_id: typeof row.plan_id === "string" ? row.plan_id : null,
+    plan_revision: row.plan_revision === null || row.plan_revision === void 0 ? null : Number(row.plan_revision),
     acceptance_criteria: safeJsonParse(row.acceptance_criteria, []),
     completed_items: safeJsonParse(row.completed_items, []),
     next_steps: safeJsonParse(row.next_steps, []),
     blockers: safeJsonParse(row.blockers, []),
+    milestone: typeof row.milestone === "string" ? row.milestone : null,
+    exact_next_action: typeof row.exact_next_action === "string" ? row.exact_next_action : null,
+    version: Number(row.version ?? 1),
     gate_enabled: Boolean(row.gate_enabled)
+  };
+}
+function planFromRow(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    revision: Number(row.revision),
+    status: row.status,
+    definition_of_done: safeJsonParse(row.definition_of_done, []),
+    critical_constraints: safeJsonParse(row.critical_constraints, []),
+    open_user_decisions: safeJsonParse(row.open_user_decisions, [])
+  };
+}
+function verificationFromRow(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    plan_revision: row.plan_revision === null || row.plan_revision === void 0 ? null : Number(row.plan_revision),
+    task_version: Number(row.task_version ?? 1),
+    workspace_digest: typeof row.workspace_digest === "string" ? row.workspace_digest : null
   };
 }
 function memoryFromRow(row) {
@@ -82,15 +170,19 @@ var MemoryStore = class {
   databasePath;
   db;
   constructor(root) {
-    this.root = dataRoot(root);
+    this.root = resolveMemoryDataRoot(root);
     mkdirSync2(this.root, { recursive: true });
     this.databasePath = join(this.root, "project-memory.sqlite3");
     this.db = new DatabaseSync(this.databasePath);
-    this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
+    this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=1000;");
     this.migrate();
   }
   close() {
     this.db.close();
+  }
+  ensureColumn(table, column, definition) {
+    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all();
+    if (!columns.some((item) => item.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
   migrate() {
     this.db.exec(`
@@ -104,9 +196,28 @@ var MemoryStore = class {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS plans (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        project_goal TEXT NOT NULL,
+        definition_of_done TEXT NOT NULL DEFAULT '[]',
+        revision INTEGER NOT NULL DEFAULT 1,
+        current_milestone TEXT,
+        critical_constraints TEXT NOT NULL DEFAULT '[]',
+        open_user_decisions TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL CHECK(status IN ('active','paused','completed')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_plans_project_status ON plans(project_id, status, updated_at DESC);
+
       CREATE TABLE IF NOT EXISTS tasks (
         id TEXT PRIMARY KEY,
         project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        plan_id TEXT REFERENCES plans(id) ON DELETE SET NULL,
+        plan_revision INTEGER,
         title TEXT NOT NULL,
         goal TEXT NOT NULL,
         status TEXT NOT NULL CHECK(status IN ('active','paused','completed')),
@@ -117,6 +228,9 @@ var MemoryStore = class {
         next_steps TEXT NOT NULL DEFAULT '[]',
         blockers TEXT NOT NULL DEFAULT '[]',
         notes TEXT,
+        milestone TEXT,
+        exact_next_action TEXT,
+        version INTEGER NOT NULL DEFAULT 1,
         gate_enabled INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
@@ -204,6 +318,9 @@ var MemoryStore = class {
         status TEXT NOT NULL CHECK(status IN ('passed','failed','skipped')),
         evidence TEXT NOT NULL,
         revision TEXT,
+        plan_revision INTEGER,
+        task_version INTEGER NOT NULL DEFAULT 1,
+        workspace_digest TEXT,
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_verifications_task ON verifications(task_id, created_at DESC);
@@ -216,9 +333,33 @@ var MemoryStore = class {
         turn_id TEXT,
         trigger TEXT NOT NULL,
         snapshot TEXT NOT NULL,
+        schema_version INTEGER NOT NULL DEFAULT 1,
+        snapshot_version INTEGER NOT NULL DEFAULT 1,
+        plan_id TEXT,
+        plan_revision INTEGER,
+        state_digest TEXT,
+        capsule_digest TEXT,
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_checkpoints_task ON checkpoints(task_id, created_at DESC);
+    `);
+    this.ensureColumn("tasks", "plan_id", "TEXT REFERENCES plans(id) ON DELETE SET NULL");
+    this.ensureColumn("tasks", "plan_revision", "INTEGER");
+    this.ensureColumn("tasks", "milestone", "TEXT");
+    this.ensureColumn("tasks", "exact_next_action", "TEXT");
+    this.ensureColumn("tasks", "version", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureColumn("verifications", "plan_revision", "INTEGER");
+    this.ensureColumn("verifications", "task_version", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureColumn("verifications", "workspace_digest", "TEXT");
+    this.ensureColumn("checkpoints", "schema_version", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureColumn("checkpoints", "snapshot_version", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureColumn("checkpoints", "plan_id", "TEXT");
+    this.ensureColumn("checkpoints", "plan_revision", "INTEGER");
+    this.ensureColumn("checkpoints", "state_digest", "TEXT");
+    this.ensureColumn("checkpoints", "capsule_digest", "TEXT");
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id, status, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_checkpoints_state ON checkpoints(project_id, state_digest, created_at DESC);
     `);
   }
   ensureProject(project2) {
@@ -229,6 +370,90 @@ var MemoryStore = class {
       ON CONFLICT(id) DO UPDATE SET root=excluded.root,name=excluded.name,remote=excluded.remote,
         git_common_dir=excluded.git_common_dir,updated_at=excluded.updated_at
     `).run(project2.id, project2.root, project2.name, project2.remote, project2.gitCommonDir, timestamp, timestamp);
+  }
+  getActivePlan(project2) {
+    this.ensureProject(project2);
+    return planFromRow(this.db.prepare("SELECT * FROM plans WHERE project_id=? AND status='active' ORDER BY updated_at DESC LIMIT 1").get(project2.id));
+  }
+  getPlan(project2, planId) {
+    this.ensureProject(project2);
+    if (!planId) return this.getActivePlan(project2);
+    return planFromRow(this.db.prepare("SELECT * FROM plans WHERE id=? AND project_id=?").get(planId, project2.id));
+  }
+  upsertPlan(project2, input) {
+    this.ensureProject(project2);
+    const existing = input.plan_id ? this.getPlan(project2, input.plan_id) : this.getActivePlan(project2);
+    if (existing && input.expected_revision !== void 0 && input.expected_revision !== existing.revision) {
+      throw new Error(`PLAN_REVISION_CONFLICT: expected ${input.expected_revision}, current ${existing.revision}`);
+    }
+    const timestamp = nowIso();
+    const next = existing ?? {
+      id: input.plan_id || newId("plan"),
+      project_id: project2.id,
+      title: compactText(input.title || input.project_goal || "Active project plan", 300),
+      project_goal: compactText(input.project_goal || input.title || "Maintain the current project mainline", 4e3),
+      definition_of_done: [],
+      revision: 1,
+      current_milestone: null,
+      critical_constraints: [],
+      open_user_decisions: [],
+      status: "active",
+      created_at: timestamp,
+      updated_at: timestamp,
+      completed_at: null
+    };
+    const candidate = {
+      title: compactText(input.title ?? next.title, 300),
+      project_goal: compactText(input.project_goal ?? next.project_goal, 4e3),
+      definition_of_done: input.definition_of_done === void 0 ? next.definition_of_done : uniqueStrings(input.definition_of_done),
+      current_milestone: input.current_milestone === void 0 ? next.current_milestone : input.current_milestone === null ? null : compactText(input.current_milestone, 1e3) || null,
+      critical_constraints: input.critical_constraints === void 0 ? next.critical_constraints : uniqueStrings(input.critical_constraints),
+      open_user_decisions: input.open_user_decisions === void 0 ? next.open_user_decisions : uniqueStrings(input.open_user_decisions),
+      status: input.status ?? next.status
+    };
+    const changed = !existing || JSON.stringify(candidate) !== JSON.stringify({
+      title: next.title,
+      project_goal: next.project_goal,
+      definition_of_done: next.definition_of_done,
+      current_milestone: next.current_milestone,
+      critical_constraints: next.critical_constraints,
+      open_user_decisions: next.open_user_decisions,
+      status: next.status
+    });
+    const plan = {
+      ...next,
+      ...candidate,
+      revision: existing && changed ? existing.revision + 1 : next.revision,
+      updated_at: changed ? timestamp : next.updated_at,
+      completed_at: candidate.status === "completed" ? next.completed_at ?? timestamp : null
+    };
+    if (plan.status === "active") {
+      this.db.prepare("UPDATE plans SET status='paused',updated_at=? WHERE project_id=? AND status='active' AND id<>?").run(timestamp, project2.id, plan.id);
+    }
+    this.db.prepare(`
+      INSERT INTO plans(id,project_id,title,project_goal,definition_of_done,revision,current_milestone,critical_constraints,open_user_decisions,status,created_at,updated_at,completed_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(id) DO UPDATE SET title=excluded.title,project_goal=excluded.project_goal,
+        definition_of_done=excluded.definition_of_done,revision=excluded.revision,current_milestone=excluded.current_milestone,
+        critical_constraints=excluded.critical_constraints,open_user_decisions=excluded.open_user_decisions,status=excluded.status,
+        updated_at=excluded.updated_at,completed_at=excluded.completed_at
+    `).run(
+      plan.id,
+      plan.project_id,
+      plan.title,
+      plan.project_goal,
+      JSON.stringify(plan.definition_of_done),
+      plan.revision,
+      plan.current_milestone,
+      JSON.stringify(plan.critical_constraints),
+      JSON.stringify(plan.open_user_decisions),
+      plan.status,
+      plan.created_at,
+      plan.updated_at,
+      plan.completed_at
+    );
+    this.exportProject(project2);
+    return plan;
   }
   getActiveTask(project2) {
     this.ensureProject(project2);
@@ -247,10 +472,23 @@ var MemoryStore = class {
   upsertTask(project2, input) {
     this.ensureProject(project2);
     const existing = input.task_id ? this.getTask(project2, input.task_id) : this.getActiveTask(project2);
+    let plan;
+    if (input.plan_id === null) {
+      plan = null;
+    } else if (input.plan_id !== void 0) {
+      plan = this.getPlan(project2, input.plan_id);
+      if (!plan) throw new Error(`PLAN_NOT_FOUND: ${input.plan_id}`);
+    } else if (existing?.plan_id) {
+      plan = this.getPlan(project2, existing.plan_id);
+    } else {
+      plan = this.getActivePlan(project2);
+    }
     const timestamp = nowIso();
-    const task = existing ?? {
+    const base = existing ?? {
       id: input.task_id || newId("task"),
       project_id: project2.id,
+      plan_id: plan?.id ?? null,
+      plan_revision: plan?.revision ?? null,
       title: compactText(input.title || input.goal || "Active project task", 300),
       goal: compactText(input.goal || input.title || "Maintain current project task", 4e3),
       status: "active",
@@ -261,32 +499,65 @@ var MemoryStore = class {
       next_steps: [],
       blockers: [],
       notes: null,
+      milestone: plan?.current_milestone ?? null,
+      exact_next_action: null,
+      version: 1,
       gate_enabled: true,
       created_at: timestamp,
       updated_at: timestamp,
       completed_at: null
     };
-    task.title = compactText(input.title ?? task.title, 300);
-    task.goal = compactText(input.goal ?? task.goal, 4e3);
-    task.status = input.status ?? task.status;
-    task.acceptance_criteria = input.acceptance_criteria === void 0 ? task.acceptance_criteria : uniqueStrings(input.acceptance_criteria);
-    task.completed_items = input.completed_items === void 0 ? task.completed_items : uniqueStrings(input.completed_items);
-    task.next_steps = input.next_steps === void 0 ? task.next_steps : uniqueStrings(input.next_steps);
-    task.blockers = input.blockers === void 0 ? task.blockers : uniqueStrings(input.blockers);
-    task.notes = input.notes === void 0 ? task.notes : compactText(input.notes, 4e3) || null;
-    task.gate_enabled = input.gate_enabled ?? task.gate_enabled;
-    task.updated_at = timestamp;
+    const candidate = {
+      plan_id: input.plan_id === null ? null : plan?.id ?? base.plan_id,
+      plan_revision: input.plan_id === null ? null : plan?.revision ?? base.plan_revision,
+      title: compactText(input.title ?? base.title, 300),
+      goal: compactText(input.goal ?? base.goal, 4e3),
+      status: input.status ?? base.status,
+      acceptance_criteria: input.acceptance_criteria === void 0 ? base.acceptance_criteria : uniqueStrings(input.acceptance_criteria),
+      completed_items: input.completed_items === void 0 ? base.completed_items : uniqueStrings(input.completed_items),
+      next_steps: input.next_steps === void 0 ? base.next_steps : uniqueStrings(input.next_steps),
+      blockers: input.blockers === void 0 ? base.blockers : uniqueStrings(input.blockers),
+      notes: input.notes === void 0 ? base.notes : input.notes === null ? null : compactText(input.notes, 4e3) || null,
+      milestone: input.milestone === void 0 ? base.milestone : input.milestone === null ? null : compactText(input.milestone, 1e3) || null,
+      exact_next_action: input.exact_next_action === void 0 ? base.exact_next_action : input.exact_next_action === null ? null : compactText(input.exact_next_action, 1e3) || null,
+      gate_enabled: input.gate_enabled ?? base.gate_enabled
+    };
+    const prior = {
+      plan_id: base.plan_id,
+      plan_revision: base.plan_revision,
+      title: base.title,
+      goal: base.goal,
+      status: base.status,
+      acceptance_criteria: base.acceptance_criteria,
+      completed_items: base.completed_items,
+      next_steps: base.next_steps,
+      blockers: base.blockers,
+      notes: base.notes,
+      milestone: base.milestone,
+      exact_next_action: base.exact_next_action,
+      gate_enabled: base.gate_enabled
+    };
+    const changed = !existing || JSON.stringify(candidate) !== JSON.stringify(prior);
+    const task = {
+      ...base,
+      ...candidate,
+      version: existing && changed ? existing.version + 1 : base.version,
+      updated_at: changed ? timestamp : base.updated_at
+    };
     task.completed_at = task.status === "completed" ? task.completed_at ?? timestamp : null;
     this.db.prepare(`
-      INSERT INTO tasks(id,project_id,title,goal,status,branch,base_revision,acceptance_criteria,completed_items,next_steps,blockers,notes,gate_enabled,created_at,updated_at,completed_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-      ON CONFLICT(id) DO UPDATE SET title=excluded.title,goal=excluded.goal,status=excluded.status,
+      INSERT INTO tasks(id,project_id,plan_id,plan_revision,title,goal,status,branch,base_revision,acceptance_criteria,completed_items,next_steps,blockers,notes,milestone,exact_next_action,version,gate_enabled,created_at,updated_at,completed_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(id) DO UPDATE SET plan_id=excluded.plan_id,plan_revision=excluded.plan_revision,title=excluded.title,goal=excluded.goal,status=excluded.status,
         acceptance_criteria=excluded.acceptance_criteria,completed_items=excluded.completed_items,next_steps=excluded.next_steps,
-        blockers=excluded.blockers,notes=excluded.notes,gate_enabled=excluded.gate_enabled,updated_at=excluded.updated_at,
+        blockers=excluded.blockers,notes=excluded.notes,milestone=excluded.milestone,exact_next_action=excluded.exact_next_action,
+        version=excluded.version,gate_enabled=excluded.gate_enabled,updated_at=excluded.updated_at,
         completed_at=excluded.completed_at
     `).run(
       task.id,
       task.project_id,
+      task.plan_id,
+      task.plan_revision,
       task.title,
       task.goal,
       task.status,
@@ -297,6 +568,9 @@ var MemoryStore = class {
       JSON.stringify(task.next_steps),
       JSON.stringify(task.blockers),
       task.notes,
+      task.milestone,
+      task.exact_next_action,
+      task.version,
       task.gate_enabled ? 1 : 0,
       task.created_at,
       task.updated_at,
@@ -493,36 +767,211 @@ var MemoryStore = class {
       status: input.status,
       evidence: compactText(input.evidence, 8e3),
       revision: project2.revision,
+      plan_revision: task.plan_revision,
+      task_version: task.version,
+      workspace_digest: project2.workspaceDigest,
       created_at: nowIso()
     };
-    this.db.prepare("INSERT INTO verifications(id,project_id,task_id,criterion,command,status,evidence,revision,created_at) VALUES(?,?,?,?,?,?,?,?,?)").run(row.id, row.project_id, row.task_id, row.criterion, row.command, row.status, row.evidence, row.revision, row.created_at);
-    return row;
+    this.db.prepare("INSERT INTO verifications(id,project_id,task_id,criterion,command,status,evidence,revision,plan_revision,task_version,workspace_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").run(
+      row.id,
+      row.project_id,
+      row.task_id,
+      row.criterion,
+      row.command,
+      row.status,
+      row.evidence,
+      row.revision,
+      row.plan_revision,
+      row.task_version,
+      row.workspace_digest,
+      row.created_at
+    );
+    return { ...row, freshness: this.verificationFreshness(project2, task, row) };
+  }
+  verificationFreshness(project2, task, verification) {
+    const plan = task.plan_id ? this.getPlan(project2, task.plan_id) : null;
+    if (plan && (task.plan_revision !== plan.revision || verification.plan_revision !== plan.revision)) return "STALE";
+    if (verification.plan_revision !== task.plan_revision || verification.task_version !== task.version) return "STALE";
+    if (!project2.revision || !project2.workspaceDigest || !verification.revision || !verification.workspace_digest) return "UNKNOWN";
+    if (verification.revision !== project2.revision || verification.workspace_digest !== project2.workspaceDigest) return "STALE";
+    return "CURRENT";
   }
   listVerifications(project2, taskId) {
-    return this.db.prepare("SELECT * FROM verifications WHERE project_id=? AND task_id=? ORDER BY created_at DESC LIMIT 50").all(project2.id, taskId);
+    const task = this.getTask(project2, taskId);
+    if (!task) return [];
+    const rows = this.db.prepare("SELECT * FROM verifications WHERE project_id=? AND task_id=? ORDER BY created_at DESC LIMIT 50").all(project2.id, taskId);
+    return rows.flatMap((row) => {
+      const verification = verificationFromRow(row);
+      return verification ? [{ ...verification, freshness: this.verificationFreshness(project2, task, verification) }] : [];
+    });
+  }
+  latestCheckpoint(project2) {
+    return this.db.prepare("SELECT * FROM checkpoints WHERE project_id=? ORDER BY created_at DESC LIMIT 1").get(project2.id) ?? null;
+  }
+  deriveNextAction(task) {
+    if (!task) return "UNKNOWN";
+    if (task.exact_next_action) return task.exact_next_action;
+    if (task.next_steps[0]) return `[derived] ${task.next_steps[0]}`;
+    const completed = new Set(task.completed_items);
+    const criterion = task.acceptance_criteria.find((item) => !completed.has(item));
+    if (criterion) return `[derived] satisfy acceptance criterion: ${criterion}`;
+    if (task.blockers[0]) return `[derived] resolve blocker: ${task.blockers[0]}`;
+    return task.status === "completed" ? "NONE" : "UNKNOWN";
+  }
+  mainlineCapsule(project2, options = {}) {
+    this.ensureProject(project2);
+    const plan = this.getActivePlan(project2);
+    const task = this.getActiveTask(project2);
+    const verifications = task ? this.listVerifications(project2, task.id) : [];
+    const currentVerification = verifications.find((item) => item.freshness === "CURRENT") ?? verifications[0] ?? null;
+    const failure = this.db.prepare(`
+      SELECT summary,content FROM memories
+      WHERE project_id=? AND status='active' AND (kind='failure' OR (kind='episodic' AND tags LIKE '%failure%'))
+      ORDER BY updated_at DESC,importance DESC LIMIT 1
+    `).get(project2.id);
+    const latestCheckpoint = this.latestCheckpoint(project2);
+    const checkpoint = options.checkpoint ?? (latestCheckpoint ? {
+      id: String(latestCheckpoint.id),
+      created_at: String(latestCheckpoint.created_at)
+    } : "NONE");
+    const capsule = {
+      capsule_schema_version: 2,
+      recovery_mode: options.recoveryMode ?? "full",
+      project: { id: project2.id, name: project2.name, root: project2.root },
+      project_goal: plan?.project_goal ?? task?.goal ?? "UNKNOWN",
+      definition_of_done: plan ? plan.definition_of_done.length ? plan.definition_of_done : "NONE" : task ? task.acceptance_criteria.length ? task.acceptance_criteria.map((item) => `[derived] ${item}`) : "NONE" : "UNKNOWN",
+      active_plan: plan ? { id: plan.id, revision: plan.revision, status: plan.status } : "UNKNOWN",
+      current_milestone: plan?.current_milestone ?? task?.milestone ?? "UNKNOWN",
+      active_work_item: task ? {
+        id: task.id,
+        version: task.version,
+        plan_revision: task.plan_revision,
+        title: task.title,
+        goal: task.goal,
+        acceptance_criteria: task.acceptance_criteria,
+        completed_items: task.completed_items
+      } : "UNKNOWN",
+      exact_next_action: this.deriveNextAction(task),
+      blockers: task ? task.blockers.length ? task.blockers : "NONE" : "UNKNOWN",
+      critical_constraints: plan ? plan.critical_constraints.length ? plan.critical_constraints : "NONE" : "UNKNOWN",
+      open_user_decisions: plan ? plan.open_user_decisions.length ? plan.open_user_decisions : "NONE" : "UNKNOWN",
+      latest_valid_verification: currentVerification ? {
+        freshness: currentVerification.freshness ?? "UNKNOWN",
+        status: currentVerification.status,
+        command_or_criterion: currentVerification.command ?? currentVerification.criterion ?? "verification",
+        evidence: compactText(currentVerification.evidence, 1e3),
+        created_at: currentVerification.created_at
+      } : {
+        freshness: task ? "NONE_CURRENT" : "UNKNOWN",
+        status: "UNKNOWN",
+        command_or_criterion: task ? "NONE" : "UNKNOWN",
+        evidence: task ? "NONE_CURRENT" : "UNKNOWN",
+        created_at: null
+      },
+      repository: {
+        branch: project2.branch ?? "UNKNOWN",
+        revision: project2.revision ?? "UNKNOWN",
+        state: project2.repositoryState,
+        workspace_digest: project2.workspaceDigest ?? "UNKNOWN"
+      },
+      recent_failed_approach: failure ? `${failure.summary}: ${compactText(failure.content, 800)}` : "NONE",
+      checkpoint
+    };
+    if (options.degradedReason) capsule.degraded_reason = compactText(options.degradedReason, 500);
+    return capsule;
+  }
+  readLastGoodCapsule(project2) {
+    return readLastGoodCapsuleFile(this.root, project2);
   }
   checkpoint(project2, input) {
     this.ensureProject(project2);
     const task = this.getTask(project2, input.taskId);
+    const plan = task?.plan_id ? this.getPlan(project2, task.plan_id) : this.getActivePlan(project2);
     const recentEvents = this.db.prepare("SELECT id,event_type,exit_code,error_signature,created_at FROM events WHERE project_id=? ORDER BY created_at DESC LIMIT 20").all(project2.id);
+    const canonicalCapsule = this.mainlineCapsule(project2, { checkpoint: "NONE" });
+    const stateDigest = sha256(JSON.stringify(canonicalCapsule));
+    const previous = this.latestCheckpoint(project2);
+    if (previous?.state_digest === stateDigest) {
+      const snapshot2 = safeJsonParse(previous.snapshot, {});
+      if (snapshot2.capsule) {
+        const rendered2 = renderMainlineCapsule(snapshot2.capsule, 6500);
+        const capsuleDigest2 = sha256(rendered2);
+        atomicWriteSync(join(this.root, "projects", project2.id, "last_good_capsule.json"), `${JSON.stringify({
+          checkpoint_id: String(previous.id),
+          state_digest: stateDigest,
+          capsule_digest: capsuleDigest2,
+          capsule: snapshot2.capsule,
+          rendered: rendered2
+        }, null, 2)}
+`);
+      }
+      return { ...previous, snapshot: snapshot2, reused: true };
+    }
+    const createdAt = nowIso();
+    const checkpointId = newId("checkpoint");
+    const capsule = this.mainlineCapsule(project2, { checkpoint: { id: checkpointId, created_at: createdAt } });
+    const rendered = renderMainlineCapsule(capsule, 6500);
+    const capsuleDigest = sha256(rendered);
     const snapshot = {
-      schema_version: 1,
-      project: { id: project2.id, root: project2.root, branch: project2.branch, revision: project2.revision },
+      schema_version: 2,
+      snapshot_version: 2,
+      project: {
+        id: project2.id,
+        root: project2.root,
+        branch: project2.branch,
+        revision: project2.revision,
+        repository_state: project2.repositoryState,
+        workspace_digest: project2.workspaceDigest
+      },
+      plan,
       task,
+      capsule,
       recent_events: recentEvents,
-      captured_at: nowIso()
+      captured_at: createdAt
     };
     const row = {
-      id: newId("checkpoint"),
+      id: checkpointId,
       project_id: project2.id,
       task_id: task?.id ?? null,
       session_id: input.sessionId ?? null,
       turn_id: input.turnId ?? null,
       trigger: compactText(input.trigger, 100),
       snapshot: JSON.stringify(snapshot),
-      created_at: nowIso()
+      schema_version: 2,
+      snapshot_version: 2,
+      plan_id: plan?.id ?? null,
+      plan_revision: plan?.revision ?? null,
+      state_digest: stateDigest,
+      capsule_digest: capsuleDigest,
+      created_at: createdAt
     };
-    this.db.prepare("INSERT INTO checkpoints(id,project_id,task_id,session_id,turn_id,trigger,snapshot,created_at) VALUES(?,?,?,?,?,?,?,?)").run(row.id, row.project_id, row.task_id, row.session_id, row.turn_id, row.trigger, row.snapshot, row.created_at);
+    this.db.prepare(`
+      INSERT INTO checkpoints(id,project_id,task_id,session_id,turn_id,trigger,snapshot,schema_version,snapshot_version,plan_id,plan_revision,state_digest,capsule_digest,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    `).run(
+      row.id,
+      row.project_id,
+      row.task_id,
+      row.session_id,
+      row.turn_id,
+      row.trigger,
+      row.snapshot,
+      row.schema_version,
+      row.snapshot_version,
+      row.plan_id,
+      row.plan_revision,
+      row.state_digest,
+      row.capsule_digest,
+      row.created_at
+    );
+    atomicWriteSync(join(this.root, "projects", project2.id, "last_good_capsule.json"), `${JSON.stringify({
+      checkpoint_id: checkpointId,
+      state_digest: stateDigest,
+      capsule_digest: capsuleDigest,
+      capsule,
+      rendered
+    }, null, 2)}
+`);
     this.exportProject(project2);
     return { ...row, snapshot };
   }
@@ -532,12 +981,15 @@ var MemoryStore = class {
       SELECT
         (SELECT count(*) FROM memories WHERE project_id=? AND status='active') active_memories,
         (SELECT count(*) FROM events WHERE project_id=?) events,
+        (SELECT count(*) FROM plans WHERE project_id=?) plans,
         (SELECT count(*) FROM tasks WHERE project_id=?) tasks,
         (SELECT count(*) FROM checkpoints WHERE project_id=?) checkpoints
-    `).get(project2.id, project2.id, project2.id, project2.id);
+    `).get(project2.id, project2.id, project2.id, project2.id, project2.id);
     return {
       project: project2,
+      active_plan: this.getActivePlan(project2),
       active_task: this.getActiveTask(project2),
+      mainline: this.mainlineCapsule(project2),
       counts,
       database_path: this.databasePath,
       export_directory: join(this.root, "projects", project2.id)
@@ -564,6 +1016,7 @@ var MemoryStore = class {
     const existing = this.db.prepare("SELECT id,root,name FROM projects WHERE id=?").get(project2.id);
     if (!existing) return { project_id: project2.id, root: project2.root, deleted: false, counts: {}, export_removed: false };
     const counts = {
+      plans: Number(this.db.prepare("SELECT count(*) n FROM plans WHERE project_id=?").get(project2.id).n),
       tasks: Number(this.db.prepare("SELECT count(*) n FROM tasks WHERE project_id=?").get(project2.id).n),
       memories: Number(this.db.prepare("SELECT count(*) n FROM memories WHERE project_id=?").get(project2.id).n),
       events: Number(this.db.prepare("SELECT count(*) n FROM events WHERE project_id=?").get(project2.id).n),
@@ -610,8 +1063,13 @@ var MemoryStore = class {
       ""
     ].join("\n");
     atomicWriteSync(join(base, "MEMORY.md"), memoryMd);
+    const plan = this.getActivePlan(project2);
+    if (plan) atomicWriteSync(join(base, "PLAN.json"), `${JSON.stringify(plan, null, 2)}
+`);
     const task = this.getActiveTask(project2);
     if (task) atomicWriteSync(join(base, "tasks", `${task.id}.json`), `${JSON.stringify(task, null, 2)}
+`);
+    atomicWriteSync(join(base, "MAINLINE.md"), `${renderMainlineCapsule(this.mainlineCapsule(project2), 6500)}
 `);
   }
 };
@@ -650,6 +1108,9 @@ function resolveProject(cwdInput) {
   const remote = git(root, ["config", "--get", "remote.origin.url"]);
   const branch = git(root, ["branch", "--show-current"]);
   const revision = git(root, ["rev-parse", "HEAD"]);
+  const status = revision === null ? null : git(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+  const repositoryState = revision === null ? "unknown" : status ? "dirty" : "clean";
+  const workspaceDigest = revision === null ? null : sha256(JSON.stringify({ revision, status: status ?? "" }));
   const identity = remote ? `remote:${remote.toLowerCase()}|common:${gitCommonDir ?? root}` : `path:${gitCommonDir ?? root}`;
   return {
     id: sha256(identity).slice(0, 24),
@@ -658,7 +1119,9 @@ function resolveProject(cwdInput) {
     remote,
     gitCommonDir,
     branch,
-    revision
+    revision,
+    repositoryState,
+    workspaceDigest
   };
 }
 
@@ -684,6 +1147,12 @@ try {
       break;
     case "status":
       output = store.status(project);
+      break;
+    case "mainline":
+      output = store.mainlineCapsule(project);
+      break;
+    case "plan":
+      output = store.getPlan(project, args[0]);
       break;
     case "task":
       output = store.getTask(project, args[0]);
@@ -712,7 +1181,7 @@ try {
       break;
     }
     default:
-      throw new Error("Usage: cli.mjs [doctor|status|task [id]|search <query>|checkpoint|consolidate [--apply]|reset-project --confirm-root <exact-project-root>] [--cwd <path>]");
+      throw new Error("Usage: cli.mjs [doctor|status|mainline|plan [id]|task [id]|search <query>|checkpoint|consolidate [--apply]|reset-project --confirm-root <exact-project-root>] [--cwd <path>]");
   }
   process.stdout.write(`${JSON.stringify(output, null, 2)}
 `);

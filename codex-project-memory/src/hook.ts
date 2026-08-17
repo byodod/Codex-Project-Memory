@@ -1,5 +1,5 @@
-import { MemoryStore } from "./storage.js";
-import { renderMemories, renderTask } from "./render.js";
+import { MemoryStore, readLastGoodCapsuleFile, resolveMemoryDataRoot } from "./storage.js";
+import { renderMainlineCapsule, renderMemories } from "./render.js";
 import { resolveProject } from "./repository.js";
 import { HookInput } from "./types.js";
 import { compactText, redact } from "./util.js";
@@ -13,6 +13,15 @@ async function readStdin(): Promise<string> {
 
 function hookContext(event: string, additionalContext: string): object {
   return { hookSpecificOutput: { hookEventName: event, additionalContext } };
+}
+
+function fallbackSessionStart(input: HookInput): object | null {
+  if (input.hook_event_name !== "SessionStart") return null;
+  const project = resolveProject(input.cwd);
+  const capsule = readLastGoodCapsuleFile(resolveMemoryDataRoot(), project);
+  if (!capsule) return null;
+  const budget = input.source === "compact" ? 6000 : 6500;
+  return hookContext("SessionStart", renderMainlineCapsule(capsule, budget));
 }
 
 function extractExitCode(value: unknown): number | null {
@@ -38,15 +47,12 @@ function extractError(value: unknown): string | null {
   return lines.length ? compactText(lines.slice(0, 3).join(" | "), 1000) : null;
 }
 
-function verificationLine(row: Record<string, unknown>): string {
-  return `${row.status}: ${row.command || row.criterion || "verification"} — ${compactText(row.evidence, 300)}`;
-}
-
 async function run(input: HookInput): Promise<object | null> {
   const store = new MemoryStore();
   const project = resolveProject(input.cwd);
   try {
     const task = store.getActiveTask(project);
+    const plan = store.getActivePlan(project);
     switch (input.hook_event_name) {
       case "SessionStart": {
         store.recordEvent(project, {
@@ -54,12 +60,22 @@ async function run(input: HookInput): Promise<object | null> {
           payload: { source: input.source, model: input.model, branch: project.branch, revision: project.revision },
           authority: "tool_observation"
         });
-        if (!task) return null;
-        const verifications = store.listVerifications(project, task.id).slice(0, 5).map(verificationLine);
+        if (!task && !plan) return null;
+        const budget = input.source === "compact" ? 6000 : 6500;
+        let capsule;
+        try {
+          capsule = store.mainlineCapsule(project);
+        } catch (error) {
+          capsule = store.readLastGoodCapsule(project);
+          if (!capsule) throw error;
+        }
         const curated = store.search(project, "", {
-          taskId: task.id, kinds: ["decision", "constraint", "project_fact", "tool_quirk"], limit: 6
+          taskId: task?.id, kinds: ["decision", "constraint", "project_fact", "tool_quirk"], limit: 4
         });
-        const context = [renderTask(task, project, verifications), renderMemories(curated, "Active curated memory")].filter(Boolean).join("\n\n");
+        const mainline = renderMainlineCapsule(capsule, budget);
+        const remaining = Math.max(0, budget - mainline.length - 2);
+        const context = [mainline, remaining >= 400 ? renderMemories(curated, "Active curated memory", remaining) : ""]
+          .filter(Boolean).join("\n\n").slice(0, budget);
         return hookContext("SessionStart", context);
       }
       case "UserPromptSubmit": {
@@ -69,14 +85,14 @@ async function run(input: HookInput): Promise<object | null> {
           eventType: "user_prompt", payload: safePrompt, authority: "user_decision"
         });
         const memories = store.search(project, compactText(safePrompt, 4000), { taskId: task?.id, limit: 6 });
-        const context = renderMemories(memories);
+        const context = renderMemories(memories, "Relevant project memory", 4000);
         return context ? hookContext("UserPromptSubmit", context) : null;
       }
       case "PreToolUse": {
         const safeInput = redact(input.tool_input);
         const query = `${input.tool_name ?? ""} ${compactText(safeInput, 5000)}`;
         const memories = store.search(project, query, { taskId: task?.id, limit: 5 });
-        const context = renderMemories(memories, "Memory relevant to the pending tool call");
+        const context = renderMemories(memories, "Memory relevant to the pending tool call", 2600);
         return context ? hookContext("PreToolUse", context) : null;
       }
       case "PostToolUse": {
@@ -101,9 +117,20 @@ async function run(input: HookInput): Promise<object | null> {
         return null;
       }
       case "PreCompact": {
-        store.checkpoint(project, {
+        try {
+          store.checkpoint(project, {
+            taskId: task?.id, sessionId: input.session_id, turnId: input.turn_id,
+            trigger: `precompact:${input.trigger ?? "unknown"}`
+          });
+        } catch (error) {
+          process.stderr.write(`Project Memory checkpoint degraded: ${error instanceof Error ? error.message : String(error)}\n`);
+        }
+        return null;
+      }
+      case "PostCompact": {
+        store.recordEvent(project, {
           taskId: task?.id, sessionId: input.session_id, turnId: input.turn_id,
-          trigger: `precompact:${input.trigger ?? "unknown"}`
+          eventType: "post_compact", payload: { trigger: input.trigger ?? "unknown" }, authority: "tool_observation"
         });
         return null;
       }
@@ -140,12 +167,21 @@ async function run(input: HookInput): Promise<object | null> {
   }
 }
 
+let parsedInput: HookInput | null = null;
 try {
   const raw = await readStdin();
-  const input = JSON.parse(raw) as HookInput;
-  const output = await run(input);
+  parsedInput = JSON.parse(raw) as HookInput;
+  const output = await run(parsedInput);
   if (output !== null) process.stdout.write(`${JSON.stringify(output)}\n`);
 } catch (error) {
-  process.stderr.write(`Project Memory hook failed: ${error instanceof Error ? error.message : String(error)}\n`);
-  process.exitCode = 1;
+  const fallback = parsedInput ? fallbackSessionStart(parsedInput) : null;
+  if (fallback) {
+    process.stderr.write(`Project Memory hook degraded: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.stdout.write(`${JSON.stringify(fallback)}\n`);
+  } else if (parsedInput?.hook_event_name === "PreCompact") {
+    process.stderr.write(`Project Memory checkpoint degraded: ${error instanceof Error ? error.message : String(error)}\n`);
+  } else {
+    process.stderr.write(`Project Memory hook failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.exitCode = 1;
+  }
 }

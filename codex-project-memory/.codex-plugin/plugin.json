@@ -1,6 +1,6 @@
 {
   "name": "codex-project-memory",
-  "version": "1.0.0+codex.20260817002701",
+  "version": "1.0.0+codex.20260817010757",
   "description": "Durable project memory for long-running Codex development.",
   "author": {
     "name": "Local developer"
@@ -19,7 +19,7 @@
   "interface": {
     "displayName": "Codex Project Memory",
     "shortDescription": "Durable memory for long Codex projects",
-    "longDescription": "Preserves project goals, decisions, failures, checkpoints, verification evidence, and next steps across compaction, resumes, and handoffs.",
+    "longDescription": "Preserves a versioned project plan, active work item, exact next action, decisions, failures, verification freshness, Git state, and deterministic checkpoints across compaction and resumes.",
     "developerName": "Local developer",
     "category": "Developer Tools",
     "capabilities": [
@@ -27,7 +27,8 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Show the active project-memory task and its open loops.",
+      "Show the current Mainline Capsule and its exact next action.",
+      "Show the active project plan and work item.",
       "Search project memory for the last failed approach.",
       "Checkpoint this task before I switch projects.",
       "Reset this project's memory from zero."

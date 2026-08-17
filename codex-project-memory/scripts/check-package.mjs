@@ -35,6 +35,17 @@ const sessionEndHandlers = hooks.hooks.SessionEnd.flatMap((registration) => regi
 if (sessionEndHandlers.some((hook) => hook.timeout === undefined || hook.timeout > 3)) {
   throw new Error("SessionEnd Hook timeout must be explicitly set to at most 3 seconds.");
 }
+const contextLimits = {
+  SessionStart: 6500,
+  UserPromptSubmit: 4000,
+  PreToolUse: 2600
+};
+for (const [event, maximum] of Object.entries(contextLimits)) {
+  const handlers = hooks.hooks[event].flatMap((registration) => registration.hooks || []);
+  if (handlers.some((hook) => hook.additionalContextLimit === undefined || hook.additionalContextLimit > maximum)) {
+    throw new Error(`${event} additionalContextLimit must be explicitly set to at most ${maximum} characters.`);
+  }
+}
 const commands = Object.values(hooks.hooks).flatMap((registrations) => registrations.flatMap((registration) => registration.hooks || []).map((hook) => hook.command));
 if (!commands.every((command) => command?.includes("dist','hook.mjs"))) throw new Error("Every lifecycle event must use the Project Memory Hook launcher.");
 if (commands.some((command) => !command?.includes("process.env.PLUGIN_ROOT"))) throw new Error("Hook launchers must resolve from PLUGIN_ROOT without shell interpolation.");

@@ -38,6 +38,11 @@ export function resolveProject(cwdInput?: string): ProjectContext {
   const remote = git(root, ["config", "--get", "remote.origin.url"]);
   const branch = git(root, ["branch", "--show-current"]);
   const revision = git(root, ["rev-parse", "HEAD"]);
+  const status = revision === null ? null : git(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+  const repositoryState = revision === null ? "unknown" : status ? "dirty" : "clean";
+  const workspaceDigest = revision === null
+    ? null
+    : sha256(JSON.stringify({ revision, status: status ?? "" }));
   const identity = remote
     ? `remote:${remote.toLowerCase()}|common:${gitCommonDir ?? root}`
     : `path:${gitCommonDir ?? root}`;
@@ -48,6 +53,8 @@ export function resolveProject(cwdInput?: string): ProjectContext {
     remote,
     gitCommonDir,
     branch,
-    revision
+    revision,
+    repositoryState,
+    workspaceDigest
   };
 }

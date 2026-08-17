@@ -20,17 +20,26 @@ test("bundled MCP server lists and calls project-memory tools over stdio", async
     await client.connect(transport);
     const listed = await client.listTools();
     const names = new Set(listed.tools.map((item) => item.name));
-    for (const required of ["task_get", "task_upsert", "memory_search", "memory_store", "verification_record", "task_checkpoint"]) {
+    for (const required of ["mainline_get", "plan_get", "plan_upsert", "task_get", "task_upsert", "memory_search", "memory_store", "verification_record", "task_checkpoint"]) {
       assert.ok(names.has(required), `${required} missing`);
     }
+    const plan = await client.callTool({
+      name: "plan_upsert",
+      arguments: { cwd, project_goal: "Prove the mainline survives", definition_of_done: ["MCP responds"], current_milestone: "stdio" }
+    });
+    assert.equal(plan.isError, undefined);
+    const planId = plan.structuredContent.result.id;
     const created = await client.callTool({
       name: "task_upsert",
-      arguments: { cwd, title: "MCP task", goal: "Prove stdio works", acceptance_criteria: ["MCP responds"], next_steps: ["call status"] }
+      arguments: { cwd, plan_id: planId, title: "MCP task", goal: "Prove stdio works", acceptance_criteria: ["MCP responds"], exact_next_action: "call status" }
     });
     assert.equal(created.isError, undefined);
     const status = await client.callTool({ name: "status", arguments: { cwd } });
     assert.equal(status.isError, undefined);
     assert.match(status.content[0].text, /MCP task/);
+    const mainline = await client.callTool({ name: "mainline_get", arguments: { cwd } });
+    assert.equal(mainline.isError, undefined);
+    assert.match(mainline.content[0].text, /call status/);
   } finally {
     await client.close();
   }

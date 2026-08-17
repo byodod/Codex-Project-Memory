@@ -19,6 +19,12 @@ try {
     case "status":
       output = store.status(project);
       break;
+    case "mainline":
+      output = store.mainlineCapsule(project);
+      break;
+    case "plan":
+      output = store.getPlan(project, args[0]);
+      break;
     case "task":
       output = store.getTask(project, args[0]);
       break;
@@ -46,7 +52,7 @@ try {
       break;
     }
     default:
-      throw new Error("Usage: cli.mjs [doctor|status|task [id]|search <query>|checkpoint|consolidate [--apply]|reset-project --confirm-root <exact-project-root>] [--cwd <path>]");
+      throw new Error("Usage: cli.mjs [doctor|status|mainline|plan [id]|task [id]|search <query>|checkpoint|consolidate [--apply]|reset-project --confirm-root <exact-project-root>] [--cwd <path>]");
   }
   process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
 } catch (error) {

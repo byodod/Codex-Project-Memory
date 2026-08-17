@@ -135,7 +135,7 @@ test("project reset removes every memory record and its human-readable export", 
 
     const reset = store.resetProject(project);
     assert.equal(reset.deleted, true);
-    assert.deepEqual(reset.counts, { tasks: 1, memories: 1, events: 1, verifications: 1, checkpoints: 1 });
+    assert.deepEqual(reset.counts, { plans: 0, tasks: 1, memories: 1, events: 1, verifications: 1, checkpoints: 1 });
     assert.equal(existsSync(exportDirectory), false);
     assert.equal(store.db.prepare("SELECT count(*) n FROM projects WHERE id=?").get(project.id).n, 0);
     assert.equal(store.db.prepare("SELECT count(*) n FROM memories WHERE project_id=?").get(project.id).n, 0);

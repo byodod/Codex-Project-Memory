@@ -8,7 +8,7 @@
         "command": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','hook.mjs')).href)\"",
         "commandWindows": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','hook.mjs')).href)\"",
         "statusMessage": "Restoring project memory",
-        "additionalContextLimit": 10000,
+        "additionalContextLimit": 6500,
         "timeout": 20
       }]
     }],
@@ -18,7 +18,7 @@
         "command": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','hook.mjs')).href)\"",
         "commandWindows": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','hook.mjs')).href)\"",
         "statusMessage": "Recalling relevant project memory",
-        "additionalContextLimit": 10000,
+        "additionalContextLimit": 4000,
         "timeout": 40
       }]
     }],
@@ -29,7 +29,7 @@
         "command": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','hook.mjs')).href)\"",
         "commandWindows": "node --no-warnings --eval \"const p=require('node:path'),u=require('node:url'),r=process.env.PLUGIN_ROOT||process.env.CLAUDE_PLUGIN_ROOT;if(!r)throw new Error('PLUGIN_ROOT is unavailable');import(u.pathToFileURL(p.join(r,'dist','hook.mjs')).href)\"",
         "statusMessage": "Checking relevant project memory",
-        "additionalContextLimit": 7000,
+        "additionalContextLimit": 2600,
         "timeout": 20
       }]
     }],
