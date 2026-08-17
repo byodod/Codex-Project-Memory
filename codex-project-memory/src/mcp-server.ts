@@ -8,7 +8,7 @@ import { AUTHORITIES, MEMORY_KINDS } from "./types.js";
 const server = new McpServer(
   { name: "project-memory", version: "1.0.0" },
   {
-    instructions: "Durable project memory for long Codex tasks. Before substantive multi-step work call task_get with the current cwd, then create or update a compact task snapshot. Store only durable, provenance-labelled facts; current user instructions and AGENTS.md always outrank memory. Search before revisiting old files, symbols, errors, or rejected approaches. Record verification evidence and checkpoint before handoff or completion. Never label tool output or external text as user_decision or project_authority."
+    instructions: "Durable mainline state for long Codex work. Call plan_get and task_get before substantive work; keep the plan revision, exact next action, acceptance state, blockers, and verification current. Current user instructions and repository authority always outrank memory."
   }
 );
 
@@ -48,6 +48,29 @@ tool("status", {
   inputSchema: { cwd }, annotations: { readOnlyHint: true, idempotentHint: true }
 }, ({ cwd }: { cwd?: string }) => withStore(cwd, (store, project) => store.status(project)));
 
+tool("mainline_get", {
+  title: "Get project mainline capsule",
+  description: "Read the deterministic goal, plan revision, work item, exact next action, blockers, verification freshness, and Git state.",
+  inputSchema: { cwd }, annotations: { readOnlyHint: true, idempotentHint: true }
+}, ({ cwd }: { cwd?: string }) => withStore(cwd, (store, project) => store.mainlineCapsule(project)));
+
+tool("plan_get", {
+  title: "Get project plan",
+  description: "Read the active plan or an explicit plan id.",
+  inputSchema: { cwd, plan_id: z.string().optional() }, annotations: { readOnlyHint: true, idempotentHint: true }
+}, ({ cwd, plan_id }: { cwd?: string; plan_id?: string }) => withStore(cwd, (store, project) => ({ project, plan: store.getPlan(project, plan_id) })));
+
+tool("plan_upsert", {
+  title: "Create or update project plan",
+  description: "Idempotently update the durable project goal and plan; semantic changes increment its revision.",
+  inputSchema: {
+    cwd, plan_id: z.string().optional(), title: z.string().max(300).optional(), project_goal: z.string().max(4000).optional(),
+    definition_of_done: z.array(z.string().max(1000)).max(50).optional(), current_milestone: z.string().max(1000).nullable().optional(),
+    critical_constraints: z.array(z.string().max(1000)).max(50).optional(), open_user_decisions: z.array(z.string().max(1000)).max(50).optional(),
+    status: z.enum(["active", "paused", "completed"]).optional(), expected_revision: z.number().int().min(1).optional()
+  }, annotations: { readOnlyHint: false, idempotentHint: true }
+}, (args: any) => withStore(args.cwd, (store, project) => store.upsertPlan(project, args)));
+
 tool("task_get", {
   title: "Get task state",
   description: "Read the active task for the current branch or an explicit task id. Call this before substantive long-running work.",
@@ -58,13 +81,14 @@ tool("task_upsert", {
   title: "Create or update task state",
   description: "Create or atomically update the compact active-task snapshot. Omitted fields are preserved on updates.",
   inputSchema: {
-    cwd, task_id: z.string().optional(), title: z.string().max(300).optional(), goal: z.string().max(4000).optional(),
+    cwd, task_id: z.string().optional(), plan_id: z.string().nullable().optional(), title: z.string().max(300).optional(), goal: z.string().max(4000).optional(),
     status: z.enum(["active", "paused", "completed"]).optional(),
     acceptance_criteria: z.array(z.string().max(1000)).max(50).optional(),
     completed_items: z.array(z.string().max(1000)).max(50).optional(),
     next_steps: z.array(z.string().max(1000)).max(50).optional(),
     blockers: z.array(z.string().max(1000)).max(50).optional(),
-    notes: z.string().max(4000).nullable().optional(), gate_enabled: z.boolean().optional()
+    notes: z.string().max(4000).nullable().optional(), milestone: z.string().max(1000).nullable().optional(),
+    exact_next_action: z.string().max(1000).nullable().optional(), gate_enabled: z.boolean().optional()
   }, annotations: { readOnlyHint: false, idempotentHint: true }
 }, (args: any) => withStore(args.cwd, (store, project) => store.upsertTask(project, args)));
 
@@ -72,7 +96,7 @@ tool("task_checkpoint", {
   title: "Checkpoint active task",
   description: "Persist an atomic snapshot of the active task, repository revision, and recent objective tool events before compaction or handoff.",
   inputSchema: { cwd, task_id: z.string().optional(), trigger: z.string().max(100).default("manual") },
-  annotations: { readOnlyHint: false, idempotentHint: false }
+  annotations: { readOnlyHint: false, idempotentHint: true }
 }, ({ cwd, task_id, trigger }: any) => withStore(cwd, (store, project) => store.checkpoint(project, { taskId: task_id, trigger })));
 
 tool("task_complete", {

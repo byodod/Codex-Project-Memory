@@ -8,16 +8,11 @@ const required = [
   ".mcp.json",
   "hooks/hooks.json",
   "skills/project-memory/SKILL.md",
-  "skills/role-runtime/SKILL.md",
   "skills/reset-project/SKILL.md",
   "skills/reset-project/agents/openai.yaml",
   "dist/mcp-server.mjs",
   "dist/hook.mjs",
-  "dist/integrated-hook.mjs",
-  "dist/cli.mjs",
-  "dist/role-mcp-server.mjs",
-  "dist/role-hook.mjs",
-  "dist/role-cli.mjs"
+  "dist/cli.mjs"
 ];
 
 for (const relative of required) await access(resolve(root, relative));
@@ -28,11 +23,11 @@ if (manifest.name !== "codex-project-memory" || manifest.mcpServers !== "./.mcp.
 const resetSkill = await readFile(resolve(root, "skills/reset-project/SKILL.md"), "utf8");
 const resetSkillUi = await readFile(resolve(root, "skills/reset-project/agents/openai.yaml"), "utf8");
 if (!resetSkill.includes("name: reset-project") || resetSkill.includes("[TODO:")) throw new Error("Reset Project slash-menu skill is invalid.");
-if (!resetSkillUi.includes('display_name: "Reset Project Runtime"') || !resetSkillUi.includes("allow_implicit_invocation: false")) {
+if (!resetSkillUi.includes('display_name: "Reset Project Memory"') || !resetSkillUi.includes("allow_implicit_invocation: false")) {
   throw new Error("Reset Project skill must be visible in the UI and explicit-only.");
 }
 if (!mcp.mcpServers?.project_memory?.args?.some((value) => value.includes("process.env.PLUGIN_ROOT"))) throw new Error("MCP entry must resolve from the PLUGIN_ROOT environment.");
-if (!mcp.mcpServers?.role_runtime?.args?.some((value) => value.includes("role-mcp-server.mjs"))) throw new Error("Integrated role_runtime MCP entry is missing.");
+if (Object.keys(mcp.mcpServers ?? {}).join(",") !== "project_memory") throw new Error("Only the project_memory MCP server may be packaged.");
 for (const event of ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact", "PostCompact", "Stop", "SessionEnd"]) {
   if (!hooks.hooks[event]?.length) throw new Error(`Missing ${event} hook.`);
 }
@@ -40,8 +35,19 @@ const sessionEndHandlers = hooks.hooks.SessionEnd.flatMap((registration) => regi
 if (sessionEndHandlers.some((hook) => hook.timeout === undefined || hook.timeout > 3)) {
   throw new Error("SessionEnd Hook timeout must be explicitly set to at most 3 seconds.");
 }
+const contextLimits = {
+  SessionStart: 6500,
+  UserPromptSubmit: 4000,
+  PreToolUse: 2600
+};
+for (const [event, maximum] of Object.entries(contextLimits)) {
+  const handlers = hooks.hooks[event].flatMap((registration) => registration.hooks || []);
+  if (handlers.some((hook) => hook.additionalContextLimit === undefined || hook.additionalContextLimit > maximum)) {
+    throw new Error(`${event} additionalContextLimit must be explicitly set to at most ${maximum} characters.`);
+  }
+}
 const commands = Object.values(hooks.hooks).flatMap((registrations) => registrations.flatMap((registration) => registration.hooks || []).map((hook) => hook.command));
-if (!commands.every((command) => command?.includes("integrated-hook.mjs"))) throw new Error("Every lifecycle event must use the integrated memory and role Hook launcher.");
+if (!commands.every((command) => command?.includes("dist','hook.mjs"))) throw new Error("Every lifecycle event must use the Project Memory Hook launcher.");
 if (commands.some((command) => !command?.includes("process.env.PLUGIN_ROOT"))) throw new Error("Hook launchers must resolve from PLUGIN_ROOT without shell interpolation.");
 const files = await Promise.all(required.map(async (relative) => [relative, (await stat(resolve(root, relative))).size]));
 process.stdout.write(`${JSON.stringify({ ok: true, manifest: manifest.version, files: Object.fromEntries(files) }, null, 2)}\n`);

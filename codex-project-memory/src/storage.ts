@@ -1,15 +1,21 @@
 import { DatabaseSync } from "node:sqlite";
 import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
-import { mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import {
   Authority,
+  MainlineCapsule,
   MemoryKind,
   MemoryRecord,
+  PlanRecord,
+  PlanStatus,
   ProjectContext,
   TaskRecord,
-  TaskStatus
+  TaskStatus,
+  VerificationFreshness,
+  VerificationRecord
 } from "./types.js";
+import { renderMainlineCapsule } from "./render.js";
 import {
   atomicWriteSync,
   clamp,
@@ -19,6 +25,7 @@ import {
   newId,
   nowIso,
   safeJsonParse,
+  sha256,
   uniqueStrings
 } from "./util.js";
 
@@ -26,6 +33,7 @@ type SqlRow = Record<string, unknown>;
 
 export interface TaskUpsertInput {
   task_id?: string;
+  plan_id?: string | null;
   title?: string;
   goal?: string;
   status?: TaskStatus;
@@ -34,7 +42,21 @@ export interface TaskUpsertInput {
   next_steps?: string[];
   blockers?: string[];
   notes?: string | null;
+  milestone?: string | null;
+  exact_next_action?: string | null;
   gate_enabled?: boolean;
+}
+
+export interface PlanUpsertInput {
+  plan_id?: string;
+  title?: string;
+  project_goal?: string;
+  definition_of_done?: string[];
+  current_milestone?: string | null;
+  critical_constraints?: string[];
+  open_user_decisions?: string[];
+  status?: PlanStatus;
+  expected_revision?: number;
 }
 
 export interface MemoryStoreInput {
@@ -68,9 +90,23 @@ export interface EventInput {
   authority?: Authority;
 }
 
-function dataRoot(explicit?: string): string {
+export function resolveMemoryDataRoot(explicit?: string): string {
   const codexHome = process.env.CODEX_HOME || join(homedir(), ".codex");
   return explicit || process.env.CODEX_PROJECT_MEMORY_HOME || process.env.PLUGIN_DATA || join(codexHome, "plugin-data", "codex-project-memory");
+}
+
+export function readLastGoodCapsuleFile(root: string, project: ProjectContext): MainlineCapsule | null {
+  const path = join(root, "projects", project.id, "last_good_capsule.json");
+  if (!existsSync(path)) return null;
+  try {
+    const stored = JSON.parse(readFileSync(path, "utf8")) as { capsule?: MainlineCapsule; capsule_digest?: string; rendered?: string };
+    if (!stored.capsule || !stored.capsule_digest || !stored.rendered) return null;
+    const rendered = renderMainlineCapsule(stored.capsule, 6500);
+    if (rendered !== stored.rendered || sha256(rendered) !== stored.capsule_digest) return null;
+    return { ...stored.capsule, recovery_mode: "degraded", degraded_reason: "using last valid checkpoint" };
+  } catch {
+    return null;
+  }
 }
 
 function taskFromRow(row?: SqlRow): TaskRecord | null {
@@ -78,11 +114,38 @@ function taskFromRow(row?: SqlRow): TaskRecord | null {
   return {
     ...(row as unknown as TaskRecord),
     status: row.status as TaskStatus,
+    plan_id: typeof row.plan_id === "string" ? row.plan_id : null,
+    plan_revision: row.plan_revision === null || row.plan_revision === undefined ? null : Number(row.plan_revision),
     acceptance_criteria: safeJsonParse(row.acceptance_criteria, []),
     completed_items: safeJsonParse(row.completed_items, []),
     next_steps: safeJsonParse(row.next_steps, []),
     blockers: safeJsonParse(row.blockers, []),
+    milestone: typeof row.milestone === "string" ? row.milestone : null,
+    exact_next_action: typeof row.exact_next_action === "string" ? row.exact_next_action : null,
+    version: Number(row.version ?? 1),
     gate_enabled: Boolean(row.gate_enabled)
+  };
+}
+
+function planFromRow(row?: SqlRow): PlanRecord | null {
+  if (!row) return null;
+  return {
+    ...(row as unknown as PlanRecord),
+    revision: Number(row.revision),
+    status: row.status as PlanStatus,
+    definition_of_done: safeJsonParse(row.definition_of_done, []),
+    critical_constraints: safeJsonParse(row.critical_constraints, []),
+    open_user_decisions: safeJsonParse(row.open_user_decisions, [])
+  };
+}
+
+function verificationFromRow(row?: SqlRow): VerificationRecord | null {
+  if (!row) return null;
+  return {
+    ...(row as unknown as VerificationRecord),
+    plan_revision: row.plan_revision === null || row.plan_revision === undefined ? null : Number(row.plan_revision),
+    task_version: Number(row.task_version ?? 1),
+    workspace_digest: typeof row.workspace_digest === "string" ? row.workspace_digest : null
   };
 }
 
@@ -106,16 +169,21 @@ export class MemoryStore {
   readonly db: DatabaseSync;
 
   constructor(root?: string) {
-    this.root = dataRoot(root);
+    this.root = resolveMemoryDataRoot(root);
     mkdirSync(this.root, { recursive: true });
     this.databasePath = join(this.root, "project-memory.sqlite3");
     this.db = new DatabaseSync(this.databasePath);
-    this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
+    this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=1000;");
     this.migrate();
   }
 
   close(): void {
     this.db.close();
+  }
+
+  private ensureColumn(table: string, column: string, definition: string): void {
+    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as SqlRow[];
+    if (!columns.some((item) => item.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 
   private migrate(): void {
@@ -130,9 +198,28 @@ export class MemoryStore {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS plans (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        project_goal TEXT NOT NULL,
+        definition_of_done TEXT NOT NULL DEFAULT '[]',
+        revision INTEGER NOT NULL DEFAULT 1,
+        current_milestone TEXT,
+        critical_constraints TEXT NOT NULL DEFAULT '[]',
+        open_user_decisions TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL CHECK(status IN ('active','paused','completed')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_plans_project_status ON plans(project_id, status, updated_at DESC);
+
       CREATE TABLE IF NOT EXISTS tasks (
         id TEXT PRIMARY KEY,
         project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        plan_id TEXT REFERENCES plans(id) ON DELETE SET NULL,
+        plan_revision INTEGER,
         title TEXT NOT NULL,
         goal TEXT NOT NULL,
         status TEXT NOT NULL CHECK(status IN ('active','paused','completed')),
@@ -143,6 +230,9 @@ export class MemoryStore {
         next_steps TEXT NOT NULL DEFAULT '[]',
         blockers TEXT NOT NULL DEFAULT '[]',
         notes TEXT,
+        milestone TEXT,
+        exact_next_action TEXT,
+        version INTEGER NOT NULL DEFAULT 1,
         gate_enabled INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
@@ -230,6 +320,9 @@ export class MemoryStore {
         status TEXT NOT NULL CHECK(status IN ('passed','failed','skipped')),
         evidence TEXT NOT NULL,
         revision TEXT,
+        plan_revision INTEGER,
+        task_version INTEGER NOT NULL DEFAULT 1,
+        workspace_digest TEXT,
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_verifications_task ON verifications(task_id, created_at DESC);
@@ -242,9 +335,33 @@ export class MemoryStore {
         turn_id TEXT,
         trigger TEXT NOT NULL,
         snapshot TEXT NOT NULL,
+        schema_version INTEGER NOT NULL DEFAULT 1,
+        snapshot_version INTEGER NOT NULL DEFAULT 1,
+        plan_id TEXT,
+        plan_revision INTEGER,
+        state_digest TEXT,
+        capsule_digest TEXT,
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_checkpoints_task ON checkpoints(task_id, created_at DESC);
+    `);
+    this.ensureColumn("tasks", "plan_id", "TEXT REFERENCES plans(id) ON DELETE SET NULL");
+    this.ensureColumn("tasks", "plan_revision", "INTEGER");
+    this.ensureColumn("tasks", "milestone", "TEXT");
+    this.ensureColumn("tasks", "exact_next_action", "TEXT");
+    this.ensureColumn("tasks", "version", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureColumn("verifications", "plan_revision", "INTEGER");
+    this.ensureColumn("verifications", "task_version", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureColumn("verifications", "workspace_digest", "TEXT");
+    this.ensureColumn("checkpoints", "schema_version", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureColumn("checkpoints", "snapshot_version", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureColumn("checkpoints", "plan_id", "TEXT");
+    this.ensureColumn("checkpoints", "plan_revision", "INTEGER");
+    this.ensureColumn("checkpoints", "state_digest", "TEXT");
+    this.ensureColumn("checkpoints", "capsule_digest", "TEXT");
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_tasks_plan ON tasks(plan_id, status, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_checkpoints_state ON checkpoints(project_id, state_digest, created_at DESC);
     `);
   }
 
@@ -256,6 +373,85 @@ export class MemoryStore {
       ON CONFLICT(id) DO UPDATE SET root=excluded.root,name=excluded.name,remote=excluded.remote,
         git_common_dir=excluded.git_common_dir,updated_at=excluded.updated_at
     `).run(project.id, project.root, project.name, project.remote, project.gitCommonDir, timestamp, timestamp);
+  }
+
+  getActivePlan(project: ProjectContext): PlanRecord | null {
+    this.ensureProject(project);
+    return planFromRow(this.db.prepare("SELECT * FROM plans WHERE project_id=? AND status='active' ORDER BY updated_at DESC LIMIT 1")
+      .get(project.id) as SqlRow | undefined);
+  }
+
+  getPlan(project: ProjectContext, planId?: string): PlanRecord | null {
+    this.ensureProject(project);
+    if (!planId) return this.getActivePlan(project);
+    return planFromRow(this.db.prepare("SELECT * FROM plans WHERE id=? AND project_id=?").get(planId, project.id) as SqlRow | undefined);
+  }
+
+  upsertPlan(project: ProjectContext, input: PlanUpsertInput): PlanRecord {
+    this.ensureProject(project);
+    const existing = input.plan_id ? this.getPlan(project, input.plan_id) : this.getActivePlan(project);
+    if (existing && input.expected_revision !== undefined && input.expected_revision !== existing.revision) {
+      throw new Error(`PLAN_REVISION_CONFLICT: expected ${input.expected_revision}, current ${existing.revision}`);
+    }
+    const timestamp = nowIso();
+    const next = existing ?? {
+      id: input.plan_id || newId("plan"),
+      project_id: project.id,
+      title: compactText(input.title || input.project_goal || "Active project plan", 300),
+      project_goal: compactText(input.project_goal || input.title || "Maintain the current project mainline", 4000),
+      definition_of_done: [],
+      revision: 1,
+      current_milestone: null,
+      critical_constraints: [],
+      open_user_decisions: [],
+      status: "active" as PlanStatus,
+      created_at: timestamp,
+      updated_at: timestamp,
+      completed_at: null
+    };
+    const candidate = {
+      title: compactText(input.title ?? next.title, 300),
+      project_goal: compactText(input.project_goal ?? next.project_goal, 4000),
+      definition_of_done: input.definition_of_done === undefined ? next.definition_of_done : uniqueStrings(input.definition_of_done),
+      current_milestone: input.current_milestone === undefined ? next.current_milestone : (input.current_milestone === null ? null : compactText(input.current_milestone, 1000) || null),
+      critical_constraints: input.critical_constraints === undefined ? next.critical_constraints : uniqueStrings(input.critical_constraints),
+      open_user_decisions: input.open_user_decisions === undefined ? next.open_user_decisions : uniqueStrings(input.open_user_decisions),
+      status: input.status ?? next.status
+    };
+    const changed = !existing || JSON.stringify(candidate) !== JSON.stringify({
+      title: next.title,
+      project_goal: next.project_goal,
+      definition_of_done: next.definition_of_done,
+      current_milestone: next.current_milestone,
+      critical_constraints: next.critical_constraints,
+      open_user_decisions: next.open_user_decisions,
+      status: next.status
+    });
+    const plan: PlanRecord = {
+      ...next,
+      ...candidate,
+      revision: existing && changed ? existing.revision + 1 : next.revision,
+      updated_at: changed ? timestamp : next.updated_at,
+      completed_at: candidate.status === "completed" ? (next.completed_at ?? timestamp) : null
+    };
+    if (plan.status === "active") {
+      this.db.prepare("UPDATE plans SET status='paused',updated_at=? WHERE project_id=? AND status='active' AND id<>?")
+        .run(timestamp, project.id, plan.id);
+    }
+    this.db.prepare(`
+      INSERT INTO plans(id,project_id,title,project_goal,definition_of_done,revision,current_milestone,critical_constraints,open_user_decisions,status,created_at,updated_at,completed_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(id) DO UPDATE SET title=excluded.title,project_goal=excluded.project_goal,
+        definition_of_done=excluded.definition_of_done,revision=excluded.revision,current_milestone=excluded.current_milestone,
+        critical_constraints=excluded.critical_constraints,open_user_decisions=excluded.open_user_decisions,status=excluded.status,
+        updated_at=excluded.updated_at,completed_at=excluded.completed_at
+    `).run(
+      plan.id, plan.project_id, plan.title, plan.project_goal, JSON.stringify(plan.definition_of_done), plan.revision,
+      plan.current_milestone, JSON.stringify(plan.critical_constraints), JSON.stringify(plan.open_user_decisions), plan.status,
+      plan.created_at, plan.updated_at, plan.completed_at
+    );
+    this.exportProject(project);
+    return plan;
   }
 
   getActiveTask(project: ProjectContext): TaskRecord | null {
@@ -279,10 +475,23 @@ export class MemoryStore {
   upsertTask(project: ProjectContext, input: TaskUpsertInput): TaskRecord {
     this.ensureProject(project);
     const existing = input.task_id ? this.getTask(project, input.task_id) : this.getActiveTask(project);
+    let plan: PlanRecord | null;
+    if (input.plan_id === null) {
+      plan = null;
+    } else if (input.plan_id !== undefined) {
+      plan = this.getPlan(project, input.plan_id);
+      if (!plan) throw new Error(`PLAN_NOT_FOUND: ${input.plan_id}`);
+    } else if (existing?.plan_id) {
+      plan = this.getPlan(project, existing.plan_id);
+    } else {
+      plan = this.getActivePlan(project);
+    }
     const timestamp = nowIso();
-    const task: TaskRecord = existing ?? {
+    const base: TaskRecord = existing ?? {
       id: input.task_id || newId("task"),
       project_id: project.id,
+      plan_id: plan?.id ?? null,
+      plan_revision: plan?.revision ?? null,
       title: compactText(input.title || input.goal || "Active project task", 300),
       goal: compactText(input.goal || input.title || "Maintain current project task", 4000),
       status: "active",
@@ -293,33 +502,56 @@ export class MemoryStore {
       next_steps: [],
       blockers: [],
       notes: null,
+      milestone: plan?.current_milestone ?? null,
+      exact_next_action: null,
+      version: 1,
       gate_enabled: true,
       created_at: timestamp,
       updated_at: timestamp,
       completed_at: null
     };
-    task.title = compactText(input.title ?? task.title, 300);
-    task.goal = compactText(input.goal ?? task.goal, 4000);
-    task.status = input.status ?? task.status;
-    task.acceptance_criteria = input.acceptance_criteria === undefined ? task.acceptance_criteria : uniqueStrings(input.acceptance_criteria);
-    task.completed_items = input.completed_items === undefined ? task.completed_items : uniqueStrings(input.completed_items);
-    task.next_steps = input.next_steps === undefined ? task.next_steps : uniqueStrings(input.next_steps);
-    task.blockers = input.blockers === undefined ? task.blockers : uniqueStrings(input.blockers);
-    task.notes = input.notes === undefined ? task.notes : compactText(input.notes, 4000) || null;
-    task.gate_enabled = input.gate_enabled ?? task.gate_enabled;
-    task.updated_at = timestamp;
+    const candidate = {
+      plan_id: input.plan_id === null ? null : (plan?.id ?? base.plan_id),
+      plan_revision: input.plan_id === null ? null : (plan?.revision ?? base.plan_revision),
+      title: compactText(input.title ?? base.title, 300),
+      goal: compactText(input.goal ?? base.goal, 4000),
+      status: input.status ?? base.status,
+      acceptance_criteria: input.acceptance_criteria === undefined ? base.acceptance_criteria : uniqueStrings(input.acceptance_criteria),
+      completed_items: input.completed_items === undefined ? base.completed_items : uniqueStrings(input.completed_items),
+      next_steps: input.next_steps === undefined ? base.next_steps : uniqueStrings(input.next_steps),
+      blockers: input.blockers === undefined ? base.blockers : uniqueStrings(input.blockers),
+      notes: input.notes === undefined ? base.notes : (input.notes === null ? null : compactText(input.notes, 4000) || null),
+      milestone: input.milestone === undefined ? base.milestone : (input.milestone === null ? null : compactText(input.milestone, 1000) || null),
+      exact_next_action: input.exact_next_action === undefined ? base.exact_next_action : (input.exact_next_action === null ? null : compactText(input.exact_next_action, 1000) || null),
+      gate_enabled: input.gate_enabled ?? base.gate_enabled
+    };
+    const prior = {
+      plan_id: base.plan_id, plan_revision: base.plan_revision, title: base.title, goal: base.goal, status: base.status,
+      acceptance_criteria: base.acceptance_criteria, completed_items: base.completed_items, next_steps: base.next_steps,
+      blockers: base.blockers, notes: base.notes, milestone: base.milestone,
+      exact_next_action: base.exact_next_action, gate_enabled: base.gate_enabled
+    };
+    const changed = !existing || JSON.stringify(candidate) !== JSON.stringify(prior);
+    const task: TaskRecord = {
+      ...base,
+      ...candidate,
+      version: existing && changed ? existing.version + 1 : base.version,
+      updated_at: changed ? timestamp : base.updated_at
+    };
     task.completed_at = task.status === "completed" ? (task.completed_at ?? timestamp) : null;
     this.db.prepare(`
-      INSERT INTO tasks(id,project_id,title,goal,status,branch,base_revision,acceptance_criteria,completed_items,next_steps,blockers,notes,gate_enabled,created_at,updated_at,completed_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-      ON CONFLICT(id) DO UPDATE SET title=excluded.title,goal=excluded.goal,status=excluded.status,
+      INSERT INTO tasks(id,project_id,plan_id,plan_revision,title,goal,status,branch,base_revision,acceptance_criteria,completed_items,next_steps,blockers,notes,milestone,exact_next_action,version,gate_enabled,created_at,updated_at,completed_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(id) DO UPDATE SET plan_id=excluded.plan_id,plan_revision=excluded.plan_revision,title=excluded.title,goal=excluded.goal,status=excluded.status,
         acceptance_criteria=excluded.acceptance_criteria,completed_items=excluded.completed_items,next_steps=excluded.next_steps,
-        blockers=excluded.blockers,notes=excluded.notes,gate_enabled=excluded.gate_enabled,updated_at=excluded.updated_at,
+        blockers=excluded.blockers,notes=excluded.notes,milestone=excluded.milestone,exact_next_action=excluded.exact_next_action,
+        version=excluded.version,gate_enabled=excluded.gate_enabled,updated_at=excluded.updated_at,
         completed_at=excluded.completed_at
     `).run(
-      task.id, task.project_id, task.title, task.goal, task.status, task.branch, task.base_revision,
+      task.id, task.project_id, task.plan_id, task.plan_revision, task.title, task.goal, task.status, task.branch, task.base_revision,
       JSON.stringify(task.acceptance_criteria), JSON.stringify(task.completed_items), JSON.stringify(task.next_steps),
-      JSON.stringify(task.blockers), task.notes, task.gate_enabled ? 1 : 0, task.created_at, task.updated_at, task.completed_at
+      JSON.stringify(task.blockers), task.notes, task.milestone, task.exact_next_action, task.version,
+      task.gate_enabled ? 1 : 0, task.created_at, task.updated_at, task.completed_at
     );
     this.exportProject(project);
     return task;
@@ -490,48 +722,185 @@ export class MemoryStore {
     command?: string;
     status: "passed" | "failed" | "skipped";
     evidence: string;
-  }): SqlRow {
+  }): VerificationRecord {
     this.ensureProject(project);
     const task = this.getTask(project, input.taskId);
     if (!task) throw new Error("An active or explicit task is required for verification evidence.");
-    const row = {
+    const row: VerificationRecord = {
       id: newId("verify"), project_id: project.id, task_id: task.id,
       criterion: compactText(input.criterion, 1000) || null,
       command: compactText(input.command, 2000) || null,
       status: input.status,
       evidence: compactText(input.evidence, 8000),
       revision: project.revision,
+      plan_revision: task.plan_revision,
+      task_version: task.version,
+      workspace_digest: project.workspaceDigest,
       created_at: nowIso()
     };
-    this.db.prepare("INSERT INTO verifications(id,project_id,task_id,criterion,command,status,evidence,revision,created_at) VALUES(?,?,?,?,?,?,?,?,?)")
-      .run(row.id, row.project_id, row.task_id, row.criterion, row.command, row.status, row.evidence, row.revision, row.created_at);
-    return row;
+    this.db.prepare("INSERT INTO verifications(id,project_id,task_id,criterion,command,status,evidence,revision,plan_revision,task_version,workspace_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+      .run(row.id, row.project_id, row.task_id, row.criterion, row.command, row.status, row.evidence, row.revision,
+        row.plan_revision, row.task_version, row.workspace_digest, row.created_at);
+    return { ...row, freshness: this.verificationFreshness(project, task, row) };
   }
 
-  listVerifications(project: ProjectContext, taskId: string): SqlRow[] {
-    return this.db.prepare("SELECT * FROM verifications WHERE project_id=? AND task_id=? ORDER BY created_at DESC LIMIT 50")
+  private verificationFreshness(project: ProjectContext, task: TaskRecord, verification: VerificationRecord): VerificationFreshness {
+    const plan = task.plan_id ? this.getPlan(project, task.plan_id) : null;
+    if (plan && (task.plan_revision !== plan.revision || verification.plan_revision !== plan.revision)) return "STALE";
+    if (verification.plan_revision !== task.plan_revision || verification.task_version !== task.version) return "STALE";
+    if (!project.revision || !project.workspaceDigest || !verification.revision || !verification.workspace_digest) return "UNKNOWN";
+    if (verification.revision !== project.revision || verification.workspace_digest !== project.workspaceDigest) return "STALE";
+    return "CURRENT";
+  }
+
+  listVerifications(project: ProjectContext, taskId: string): VerificationRecord[] {
+    const task = this.getTask(project, taskId);
+    if (!task) return [];
+    const rows = this.db.prepare("SELECT * FROM verifications WHERE project_id=? AND task_id=? ORDER BY created_at DESC LIMIT 50")
       .all(project.id, taskId) as SqlRow[];
+    return rows.flatMap((row) => {
+      const verification = verificationFromRow(row);
+      return verification ? [{ ...verification, freshness: this.verificationFreshness(project, task, verification) }] : [];
+    });
+  }
+
+  private latestCheckpoint(project: ProjectContext): SqlRow | null {
+    return this.db.prepare("SELECT * FROM checkpoints WHERE project_id=? ORDER BY created_at DESC LIMIT 1")
+      .get(project.id) as SqlRow | undefined ?? null;
+  }
+
+  private deriveNextAction(task: TaskRecord | null): string {
+    if (!task) return "UNKNOWN";
+    if (task.exact_next_action) return task.exact_next_action;
+    if (task.next_steps[0]) return `[derived] ${task.next_steps[0]}`;
+    const completed = new Set(task.completed_items);
+    const criterion = task.acceptance_criteria.find((item) => !completed.has(item));
+    if (criterion) return `[derived] satisfy acceptance criterion: ${criterion}`;
+    if (task.blockers[0]) return `[derived] resolve blocker: ${task.blockers[0]}`;
+    return task.status === "completed" ? "NONE" : "UNKNOWN";
+  }
+
+  mainlineCapsule(project: ProjectContext, options: {
+    checkpoint?: { id: string; created_at: string } | "NONE";
+    recoveryMode?: "full" | "degraded";
+    degradedReason?: string;
+  } = {}): MainlineCapsule {
+    this.ensureProject(project);
+    const plan = this.getActivePlan(project);
+    const task = this.getActiveTask(project);
+    const verifications = task ? this.listVerifications(project, task.id) : [];
+    const currentVerification = verifications.find((item) => item.freshness === "CURRENT") ?? verifications[0] ?? null;
+    const failure = this.db.prepare(`
+      SELECT summary,content FROM memories
+      WHERE project_id=? AND status='active' AND (kind='failure' OR (kind='episodic' AND tags LIKE '%failure%'))
+      ORDER BY updated_at DESC,importance DESC LIMIT 1
+    `).get(project.id) as SqlRow | undefined;
+    const latestCheckpoint = this.latestCheckpoint(project);
+    const checkpoint = options.checkpoint ?? (latestCheckpoint ? {
+      id: String(latestCheckpoint.id), created_at: String(latestCheckpoint.created_at)
+    } : "NONE");
+    const capsule: MainlineCapsule = {
+      capsule_schema_version: 2,
+      recovery_mode: options.recoveryMode ?? "full",
+      project: { id: project.id, name: project.name, root: project.root },
+      project_goal: plan?.project_goal ?? task?.goal ?? "UNKNOWN",
+      definition_of_done: plan
+        ? (plan.definition_of_done.length ? plan.definition_of_done : "NONE")
+        : (task ? (task.acceptance_criteria.length ? task.acceptance_criteria.map((item) => `[derived] ${item}`) : "NONE") : "UNKNOWN"),
+      active_plan: plan ? { id: plan.id, revision: plan.revision, status: plan.status } : "UNKNOWN",
+      current_milestone: plan?.current_milestone ?? task?.milestone ?? "UNKNOWN",
+      active_work_item: task ? {
+        id: task.id, version: task.version, plan_revision: task.plan_revision, title: task.title, goal: task.goal,
+        acceptance_criteria: task.acceptance_criteria, completed_items: task.completed_items
+      } : "UNKNOWN",
+      exact_next_action: this.deriveNextAction(task),
+      blockers: task ? (task.blockers.length ? task.blockers : "NONE") : "UNKNOWN",
+      critical_constraints: plan ? (plan.critical_constraints.length ? plan.critical_constraints : "NONE") : "UNKNOWN",
+      open_user_decisions: plan ? (plan.open_user_decisions.length ? plan.open_user_decisions : "NONE") : "UNKNOWN",
+      latest_valid_verification: currentVerification ? {
+        freshness: currentVerification.freshness ?? "UNKNOWN",
+        status: currentVerification.status,
+        command_or_criterion: currentVerification.command ?? currentVerification.criterion ?? "verification",
+        evidence: compactText(currentVerification.evidence, 1000),
+        created_at: currentVerification.created_at
+      } : {
+        freshness: task ? "NONE_CURRENT" : "UNKNOWN",
+        status: "UNKNOWN",
+        command_or_criterion: task ? "NONE" : "UNKNOWN",
+        evidence: task ? "NONE_CURRENT" : "UNKNOWN",
+        created_at: null
+      },
+      repository: {
+        branch: project.branch ?? "UNKNOWN",
+        revision: project.revision ?? "UNKNOWN",
+        state: project.repositoryState,
+        workspace_digest: project.workspaceDigest ?? "UNKNOWN"
+      },
+      recent_failed_approach: failure ? `${failure.summary}: ${compactText(failure.content, 800)}` : "NONE",
+      checkpoint
+    };
+    if (options.degradedReason) capsule.degraded_reason = compactText(options.degradedReason, 500);
+    return capsule;
+  }
+
+  readLastGoodCapsule(project: ProjectContext): MainlineCapsule | null {
+    return readLastGoodCapsuleFile(this.root, project);
   }
 
   checkpoint(project: ProjectContext, input: { taskId?: string; sessionId?: string; turnId?: string; trigger: string }): SqlRow {
     this.ensureProject(project);
     const task = this.getTask(project, input.taskId);
+    const plan = task?.plan_id ? this.getPlan(project, task.plan_id) : this.getActivePlan(project);
     const recentEvents = this.db.prepare("SELECT id,event_type,exit_code,error_signature,created_at FROM events WHERE project_id=? ORDER BY created_at DESC LIMIT 20")
       .all(project.id);
+    const canonicalCapsule = this.mainlineCapsule(project, { checkpoint: "NONE" });
+    const stateDigest = sha256(JSON.stringify(canonicalCapsule));
+    const previous = this.latestCheckpoint(project);
+    if (previous?.state_digest === stateDigest) {
+      const snapshot = safeJsonParse(previous.snapshot, {}) as { capsule?: MainlineCapsule };
+      if (snapshot.capsule) {
+        const rendered = renderMainlineCapsule(snapshot.capsule, 6500);
+        const capsuleDigest = sha256(rendered);
+        atomicWriteSync(join(this.root, "projects", project.id, "last_good_capsule.json"), `${JSON.stringify({
+          checkpoint_id: String(previous.id), state_digest: stateDigest, capsule_digest: capsuleDigest,
+          capsule: snapshot.capsule, rendered
+        }, null, 2)}\n`);
+      }
+      return { ...previous, snapshot, reused: true };
+    }
+    const createdAt = nowIso();
+    const checkpointId = newId("checkpoint");
+    const capsule = this.mainlineCapsule(project, { checkpoint: { id: checkpointId, created_at: createdAt } });
+    const rendered = renderMainlineCapsule(capsule, 6500);
+    const capsuleDigest = sha256(rendered);
     const snapshot = {
-      schema_version: 1,
-      project: { id: project.id, root: project.root, branch: project.branch, revision: project.revision },
+      schema_version: 2,
+      snapshot_version: 2,
+      project: {
+        id: project.id, root: project.root, branch: project.branch, revision: project.revision,
+        repository_state: project.repositoryState, workspace_digest: project.workspaceDigest
+      },
+      plan,
       task,
+      capsule,
       recent_events: recentEvents,
-      captured_at: nowIso()
+      captured_at: createdAt
     };
     const row = {
-      id: newId("checkpoint"), project_id: project.id, task_id: task?.id ?? null,
+      id: checkpointId, project_id: project.id, task_id: task?.id ?? null,
       session_id: input.sessionId ?? null, turn_id: input.turnId ?? null,
-      trigger: compactText(input.trigger, 100), snapshot: JSON.stringify(snapshot), created_at: nowIso()
+      trigger: compactText(input.trigger, 100), snapshot: JSON.stringify(snapshot),
+      schema_version: 2, snapshot_version: 2, plan_id: plan?.id ?? null, plan_revision: plan?.revision ?? null,
+      state_digest: stateDigest, capsule_digest: capsuleDigest, created_at: createdAt
     };
-    this.db.prepare("INSERT INTO checkpoints(id,project_id,task_id,session_id,turn_id,trigger,snapshot,created_at) VALUES(?,?,?,?,?,?,?,?)")
-      .run(row.id, row.project_id, row.task_id, row.session_id, row.turn_id, row.trigger, row.snapshot, row.created_at);
+    this.db.prepare(`
+      INSERT INTO checkpoints(id,project_id,task_id,session_id,turn_id,trigger,snapshot,schema_version,snapshot_version,plan_id,plan_revision,state_digest,capsule_digest,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    `).run(row.id, row.project_id, row.task_id, row.session_id, row.turn_id, row.trigger, row.snapshot,
+      row.schema_version, row.snapshot_version, row.plan_id, row.plan_revision, row.state_digest, row.capsule_digest, row.created_at);
+    atomicWriteSync(join(this.root, "projects", project.id, "last_good_capsule.json"), `${JSON.stringify({
+      checkpoint_id: checkpointId, state_digest: stateDigest, capsule_digest: capsuleDigest, capsule, rendered
+    }, null, 2)}\n`);
     this.exportProject(project);
     return { ...row, snapshot };
   }
@@ -542,12 +911,15 @@ export class MemoryStore {
       SELECT
         (SELECT count(*) FROM memories WHERE project_id=? AND status='active') active_memories,
         (SELECT count(*) FROM events WHERE project_id=?) events,
+        (SELECT count(*) FROM plans WHERE project_id=?) plans,
         (SELECT count(*) FROM tasks WHERE project_id=?) tasks,
         (SELECT count(*) FROM checkpoints WHERE project_id=?) checkpoints
-    `).get(project.id, project.id, project.id, project.id) as SqlRow;
+    `).get(project.id, project.id, project.id, project.id, project.id) as SqlRow;
     return {
       project,
+      active_plan: this.getActivePlan(project),
       active_task: this.getActiveTask(project),
+      mainline: this.mainlineCapsule(project),
       counts,
       database_path: this.databasePath,
       export_directory: join(this.root, "projects", project.id)
@@ -575,6 +947,7 @@ export class MemoryStore {
     const existing = this.db.prepare("SELECT id,root,name FROM projects WHERE id=?").get(project.id) as SqlRow | undefined;
     if (!existing) return { project_id: project.id, root: project.root, deleted: false, counts: {}, export_removed: false };
     const counts = {
+      plans: Number((this.db.prepare("SELECT count(*) n FROM plans WHERE project_id=?").get(project.id) as SqlRow).n),
       tasks: Number((this.db.prepare("SELECT count(*) n FROM tasks WHERE project_id=?").get(project.id) as SqlRow).n),
       memories: Number((this.db.prepare("SELECT count(*) n FROM memories WHERE project_id=?").get(project.id) as SqlRow).n),
       events: Number((this.db.prepare("SELECT count(*) n FROM events WHERE project_id=?").get(project.id) as SqlRow).n),
@@ -620,7 +993,10 @@ export class MemoryStore {
       ""
     ].join("\n");
     atomicWriteSync(join(base, "MEMORY.md"), memoryMd);
+    const plan = this.getActivePlan(project);
+    if (plan) atomicWriteSync(join(base, "PLAN.json"), `${JSON.stringify(plan, null, 2)}\n`);
     const task = this.getActiveTask(project);
     if (task) atomicWriteSync(join(base, "tasks", `${task.id}.json`), `${JSON.stringify(task, null, 2)}\n`);
+    atomicWriteSync(join(base, "MAINLINE.md"), `${renderMainlineCapsule(this.mainlineCapsule(project), 6500)}\n`);
   }
 }

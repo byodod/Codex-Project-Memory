@@ -91,10 +91,10 @@ test("FTS relevance is not discarded by authority boosts and returned recall met
       authority: "user_decision", importance: 1
     });
     const failure = store.storeMemory(project, {
-      kind: "failure", summary: "Coordinator bootstrap timeout", content: "role_start left a bootstrapping candidate after a coordinator timeout and recursive retry",
+      kind: "failure", summary: "Generator bootstrap timeout", content: "the bootstrap command left a pending candidate after a timeout and recursive retry",
       authority: "tool_observation", importance: 1
     });
-    const results = store.search(project, "coordinator bootstrap timeout recursive role_start candidate", { limit: 5 });
+    const results = store.search(project, "generator bootstrap timeout recursive retry candidate", { limit: 5 });
     assert.equal(results[0].id, failure.id);
     assert.equal(results[0].recall_count, 1);
     assert.ok(results[0].last_recalled_at);
@@ -135,7 +135,7 @@ test("project reset removes every memory record and its human-readable export", 
 
     const reset = store.resetProject(project);
     assert.equal(reset.deleted, true);
-    assert.deepEqual(reset.counts, { tasks: 1, memories: 1, events: 1, verifications: 1, checkpoints: 1 });
+    assert.deepEqual(reset.counts, { plans: 0, tasks: 1, memories: 1, events: 1, verifications: 1, checkpoints: 1 });
     assert.equal(existsSync(exportDirectory), false);
     assert.equal(store.db.prepare("SELECT count(*) n FROM projects WHERE id=?").get(project.id).n, 0);
     assert.equal(store.db.prepare("SELECT count(*) n FROM memories WHERE project_id=?").get(project.id).n, 0);
